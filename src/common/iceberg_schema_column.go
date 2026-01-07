@@ -42,6 +42,9 @@ const (
 	PARQUET_MAX_DECIMAL_PRECISION  = 38
 	PARQUET_FALLBACK_DECIMAL_SCALE = 6
 	PARQUET_NESTED_FIELD_ID_PREFIX = 1000
+
+	EMBEDDING_COLUMN_NAME   = "_bemi_embedding"
+	EMBEDDING_COLUMN_LENGTH = "1536"
 )
 
 type CatalogTableColumn struct {
@@ -53,6 +56,10 @@ type CatalogTableColumn struct {
 }
 
 func (tableColumn CatalogTableColumn) ToSql() string {
+	if tableColumn.Name == EMBEDDING_COLUMN_NAME {
+		return `"` + EMBEDDING_COLUMN_NAME + `" ` + `FLOAT[` + EMBEDDING_COLUMN_LENGTH + `]`
+	}
+
 	sql := fmt.Sprintf(`"%s" %s`, tableColumn.Name, tableColumn.Type)
 
 	if tableColumn.List {

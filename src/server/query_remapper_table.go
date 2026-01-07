@@ -13,15 +13,18 @@ import (
 var PG_CATALOG_TABLE_NAMES = common.Set[string]{}
 
 type QueryRemapperTable struct {
-	parserTable                   *ParserTable
-	parserFunction                *ParserFunction
-	remapperFunction              *QueryRemapperFunction
+	parserTable        *ParserTable
+	parserFunction     *ParserFunction
+	remapperFunction   *QueryRemapperFunction
+	icebergReader      *IcebergReader
+	config             *Config
+	ServerDuckdbClient *common.DuckdbClient // nilable
+
+	// Runtime loaded
 	IcebergPersistentSchemaTables common.Set[common.IcebergSchemaTable]
 	IcebergMaterlizedSchemaTables common.Set[common.IcebergSchemaTable]
+	IcebergEmbeddingSchemaTables  common.Set[common.IcebergSchemaTable]
 	IcebergMaterializedViews      []common.IcebergMaterializedView
-	icebergReader                 *IcebergReader
-	ServerDuckdbClient            *common.DuckdbClient // nilable
-	config                        *Config
 }
 
 func NewQueryRemapperTable(config *Config, icebergReader *IcebergReader, serverDuckdbClient *common.DuckdbClient) *QueryRemapperTable {
@@ -33,7 +36,7 @@ func NewQueryRemapperTable(config *Config, icebergReader *IcebergReader, serverD
 		ServerDuckdbClient: serverDuckdbClient,
 		config:             config,
 	}
-	remapper.reloadIcebergTables()
+	remapper.Reset()
 	return remapper
 }
 
@@ -90,10 +93,6 @@ func (remapper *QueryRemapperTable) RemapTable(node *pgQuery.Node, permissions *
 		return node
 	}
 
-	// public.table -> (SELECT * FROM iceberg_scan('path')) table
-	// schema.table -> (SELECT * FROM iceberg_scan('path')) schema_table
-	// public.table -> (SELECT permitted, columns FROM iceberg_scan('path')) table
-	// public.table -> (SELECT NULL WHERE FALSE) table
 	schemaTable := qSchemaTable.ToIcebergSchemaTable()
 	if !remapper.IcebergPersistentSchemaTables.Contains(schemaTable) && !remapper.IcebergMaterlizedSchemaTables.Contains(schemaTable) { // Reload Iceberg tables if not found
 		remapper.reloadIcebergTables()
@@ -101,8 +100,17 @@ func (remapper *QueryRemapperTable) RemapTable(node *pgQuery.Node, permissions *
 			return node // Let it return "Catalog Error: Table with name _ does not exist!"
 		}
 	}
-	icebergPath := remapper.icebergReader.MetadataFileS3Path(schemaTable) // iceberg/schema/table/metadata/v1.metadata.json
 
+	// public.table_with_embedding -> return as is
+	if remapper.IcebergEmbeddingSchemaTables.Contains(schemaTable) {
+		return node
+	}
+
+	// public.table -> (SELECT * FROM iceberg_scan('path')) table
+	// schema.table -> (SELECT * FROM iceberg_scan('path')) schema_table
+	// public.table -> (SELECT permitted, columns FROM iceberg_scan('path')) table
+	// public.table -> (SELECT NULL WHERE FALSE) table
+	icebergPath := remapper.icebergReader.MetadataFileS3Path(schemaTable) // iceberg/schema/table/metadata/v1.metadata.json
 	return parser.MakeIcebergTableNode(QueryToIcebergTable{
 		QuerySchemaTable: qSchemaTable,
 		IcebergTablePath: icebergPath,
@@ -133,6 +141,15 @@ func (remapper *QueryRemapperTable) RemapTableFunctionCall(rangeFunction *pgQuer
 	}
 }
 
+func (remapper *QueryRemapperTable) Reset() {
+	remapper.IcebergPersistentSchemaTables = common.NewSet[common.IcebergSchemaTable]()
+	remapper.IcebergMaterlizedSchemaTables = common.NewSet[common.IcebergSchemaTable]()
+	remapper.IcebergEmbeddingSchemaTables = common.NewSet[common.IcebergSchemaTable]()
+	remapper.IcebergMaterializedViews = []common.IcebergMaterializedView{}
+
+	remapper.reloadIcebergTables()
+}
+
 func (remapper *QueryRemapperTable) reloadIcebergTables() {
 	remapper.reloadIcebergMaterializedViews()
 	remapper.reloadIcebergPersistentTables()
@@ -151,28 +168,45 @@ func (remapper *QueryRemapperTable) reloadIcebergPersistentTables() {
 	remapper.IcebergPersistentSchemaTables = newIcebergSchemaTables
 
 	ctx := context.Background()
-	// CREATE TABLE IF NOT EXISTS
+	// CREATE TABLE
 	for _, icebergSchemaTable := range newIcebergSchemaTables.Values() {
 		if !previousIcebergSchemaTables.Contains(icebergSchemaTable) {
 			catalogTableColumns, err := remapper.icebergReader.TableColumns(icebergSchemaTable)
 			common.PanicIfError(remapper.config.CommonConfig, err)
 
 			var sqlColumns []string
+			hasEmbeddingColumn := false
 			for _, catalogTableColumn := range catalogTableColumns {
 				sqlColumns = append(sqlColumns, catalogTableColumn.ToSql())
+				if catalogTableColumn.Name == common.EMBEDDING_COLUMN_NAME {
+					hasEmbeddingColumn = true
+				}
 			}
 
+			// Create schema and table
 			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+icebergSchemaTable.Schema)
 			common.PanicIfError(remapper.config.CommonConfig, err)
-			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE TABLE IF NOT EXISTS "+icebergSchemaTable.String()+" ("+strings.Join(sqlColumns, ", ")+")")
+			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE TABLE "+icebergSchemaTable.String()+" ("+strings.Join(sqlColumns, ", ")+")")
 			common.PanicIfError(remapper.config.CommonConfig, err)
+
+			// Reload embedding table data and create a cosine index
+			if hasEmbeddingColumn {
+				icebergPath := remapper.icebergReader.MetadataFileS3Path(icebergSchemaTable)
+				_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "INSERT INTO "+icebergSchemaTable.String()+" SELECT * FROM iceberg_scan('"+icebergPath+"')")
+				common.PanicIfError(remapper.config.CommonConfig, err)
+
+				_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE INDEX "+icebergSchemaTable.Table+"_embedding ON "+icebergSchemaTable.String()+" USING HNSW ("+common.EMBEDDING_COLUMN_NAME+") WITH (metric='cosine')")
+				common.PanicIfError(remapper.config.CommonConfig, err)
+				remapper.IcebergEmbeddingSchemaTables.Add(icebergSchemaTable)
+			}
 		}
 	}
-	// DROP TABLE IF EXISTS
+	// DROP TABLE
 	for _, icebergSchemaTable := range previousIcebergSchemaTables.Values() {
 		if !newIcebergSchemaTables.Contains(icebergSchemaTable) {
-			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "DROP TABLE IF EXISTS "+icebergSchemaTable.String())
+			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "DROP TABLE "+icebergSchemaTable.String())
 			common.PanicIfError(remapper.config.CommonConfig, err)
+			remapper.IcebergEmbeddingSchemaTables.Remove(icebergSchemaTable)
 		}
 	}
 }
@@ -191,21 +225,21 @@ func (remapper *QueryRemapperTable) reloadIcebergMaterializedViews() {
 	remapper.IcebergMaterlizedSchemaTables = newMaterializedSchemaTables
 
 	ctx := context.Background()
-	// CREATE VIEW IF NOT EXISTS
+	// CREATE VIEW
 	for _, icebergSchemaTable := range remapper.IcebergMaterlizedSchemaTables.Values() {
 		if !previousIcebergSchemaTables.Contains(icebergSchemaTable) {
 			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE SCHEMA IF NOT EXISTS "+icebergSchemaTable.Schema)
 			common.PanicIfError(remapper.config.CommonConfig, err)
-			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE VIEW IF NOT EXISTS "+icebergSchemaTable.String()+" AS SELECT 1")
+			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "CREATE VIEW "+icebergSchemaTable.String()+" AS SELECT 1")
 			common.PanicIfError(remapper.config.CommonConfig, err)
 			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "INSERT INTO pg_matviews VALUES ('"+icebergSchemaTable.Schema+"', '"+icebergSchemaTable.Table+"', '"+remapper.config.User+"', NULL, FALSE, TRUE, '')")
 			common.PanicIfError(remapper.config.CommonConfig, err)
 		}
 	}
-	// DROP VIEW IF EXISTS
+	// DROP VIEW
 	for _, icebergSchemaTable := range previousIcebergSchemaTables.Values() {
 		if !newMaterializedSchemaTables.Contains(icebergSchemaTable) {
-			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "DROP VIEW IF EXISTS "+icebergSchemaTable.String())
+			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "DROP VIEW "+icebergSchemaTable.String())
 			common.PanicIfError(remapper.config.CommonConfig, err)
 			_, err = remapper.ServerDuckdbClient.ExecContext(ctx, "DELETE FROM pg_matviews WHERE schemaname = '"+icebergSchemaTable.Schema+"' AND matviewname = '"+icebergSchemaTable.Table+"'")
 			common.PanicIfError(remapper.config.CommonConfig, err)
@@ -731,6 +765,7 @@ func CreateInformationSchemaTableQueries(config *Config) []string {
 				WHEN 'DATE[]' THEN '_date'
 				WHEN 'FLOAT' THEN 'float4'
 				WHEN 'FLOAT[]' THEN '_float4'
+				WHEN 'FLOAT[` + common.EMBEDDING_COLUMN_LENGTH + `]' THEN '_float4'
 				WHEN 'DOUBLE' THEN 'float8'
 				WHEN 'DOUBLE[]' THEN '_float8'
 				WHEN 'DECIMAL' THEN 'numeric'

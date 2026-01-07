@@ -37,6 +37,19 @@ case "${1:-}" in
     ./bin/syncer-attio 2>&1 | sed 's/^/[Syncer] /'
     echo "Syncer for Attio finished."
     ;;
+  syncer-dialpad)
+    : "${NATS_URL:?Environment variable NATS_URL must be set}"
+    : "${NATS_JETSTREAM_STREAM:?Environment variable NATS_JETSTREAM_STREAM must be set}"
+    : "${NATS_JETSTREAM_SUBJECT:?Environment variable NATS_JETSTREAM_SUBJECT must be set}"
+    : "${NATS_JETSTREAM_CONSUMER_NAME:?Environment variable NATS_JETSTREAM_CONSUMER_NAME must be set}"
+    : "${DESTINATION_SCHEMA_NAME:?Environment variable DESTINATION_SCHEMA_NAME must be set}"
+
+    psql $CATALOG_DATABASE_URL -f /app/scripts/catalog.sql
+
+    echo "Starting Syncer for Dialpad..."
+    ./bin/syncer-dialpad 2>&1 | sed 's/^/[Syncer] /'
+    echo "Syncer for Dialpad finished."
+    ;;
   server)
     : "${AWS_REGION:?Environment variable AWS_REGION must be set}"
     : "${AWS_S3_BUCKET:?Environment variable AWS_S3_BUCKET must be set}"

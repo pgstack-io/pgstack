@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -15,7 +16,8 @@ import (
 )
 
 const (
-	FALLBACK_SQL_QUERY = "SELECT 1"
+	FALLBACK_SQL_QUERY        = "SELECT 1"
+	PREPARE_STATEMENT_TIMEOUT = 30 * time.Second
 )
 
 type QueryHandler struct {
@@ -110,7 +112,6 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 }
 
 func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]pgproto3.Message, *PreparedStatement, error) {
-	ctx := context.Background()
 	originalQuery := string(message.Query)
 	queryStatements, _, err := queryHandler.QueryRemapper.ParseAndRemapQuery(originalQuery)
 	if err != nil {
@@ -131,13 +132,40 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 
 	query := queryStatements[0]
 	preparedStatement.Query = query
-	statement, err := queryHandler.ServerDuckdbClient.PrepareContext(ctx, query)
+	statement, err := queryHandler.prepareContextWithTimeout(query)
 	preparedStatement.Statement = statement
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
+}
+
+func (queryHandler *QueryHandler) prepareContextWithTimeout(query string) (*sql.Stmt, error) {
+	ctx := context.Background()
+	timeoutCtx, cancel := context.WithTimeout(ctx, PREPARE_STATEMENT_TIMEOUT)
+	defer cancel()
+
+	type result struct {
+		statement *sql.Stmt
+		err       error
+	}
+	resultChan := make(chan result, 1)
+
+	go func() {
+		statement, err := queryHandler.ServerDuckdbClient.PrepareContext(timeoutCtx, query)
+		resultChan <- result{statement, err}
+	}()
+
+	select {
+	case res := <-resultChan:
+		return res.statement, res.err
+	case <-timeoutCtx.Done():
+		common.LogWarn(queryHandler.Config.CommonConfig, "PrepareContext timed out, recreating DuckDB connection")
+		queryHandler.ServerDuckdbClient.RecreateDb()
+		queryHandler.QueryRemapper.remapperTable.Reset()
+		return queryHandler.ServerDuckdbClient.PrepareContext(ctx, query)
+	}
 }
 
 func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {

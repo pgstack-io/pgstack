@@ -217,9 +217,7 @@ func (writer *IcebergTableWriter) insertRows(loadRowsToDuckdbTableFunc func(duck
 		}
 
 		// Delete old files
-		for _, key := range objectsToDeleteKeys {
-			writer.deleteObject(key)
-		}
+		writer.deleteObjects(objectsToDeleteKeys)
 		objectsToDeleteKeys = []string{}
 
 		if reachedEnd {
@@ -269,6 +267,8 @@ func (writer *IcebergTableWriter) appendRows(metadataFileS3Path string, cursorVa
 			} else {
 				break // no more rows to append
 			}
+		} else if loadedRowCount == 1 && cursorValue.OverrideAppendedRows && cursorValue.StringValue != "" && newParquetFileCount == 0 {
+			return // exit if there is a single row to append with OverrideAppendedRows (to avoid overriding the pulled cursor value)
 		}
 
 		// Create parquet
@@ -296,9 +296,7 @@ func (writer *IcebergTableWriter) appendRows(metadataFileS3Path string, cursorVa
 	writer.StorageS3.CreateMetadata(metadataS3Path, writer.IcebergSchemaColumns, []ManifestListFile{manifestListFile})
 
 	// Delete old files
-	for _, key := range objectsToDeleteKeys {
-		writer.deleteObject(key)
-	}
+	writer.deleteObjects(objectsToDeleteKeys)
 }
 
 func (writer *IcebergTableWriter) updateRows(metadataFileS3Path string, uniqueIndexColumnNames []string, loadRowsToDuckdbTableFunc func(duckdbTableName string, loadedSize int64) (loadedRowCount int64, reachedEnd bool)) {
@@ -372,9 +370,7 @@ func (writer *IcebergTableWriter) updateRows(metadataFileS3Path string, uniqueIn
 	writer.StorageS3.CreateMetadata(metadataS3Path, writer.IcebergSchemaColumns, []ManifestListFile{manifestListFile})
 
 	// Delete old files
-	for _, key := range objectsToDeleteKeys {
-		writer.deleteObject(key)
-	}
+	writer.deleteObjects(objectsToDeleteKeys)
 }
 
 func (writer *IcebergTableWriter) deleteRows(metadataFileS3Path string, uniqueIndexColumnNames []string, loadRowsToDuckdbTableFunc func(duckdbTableName string, loadedSize int64) (loadedRowCount int64, reachedEnd bool)) {
@@ -446,9 +442,7 @@ func (writer *IcebergTableWriter) deleteRows(metadataFileS3Path string, uniqueIn
 	writer.StorageS3.CreateMetadata(metadataS3Path, writer.IcebergSchemaColumns, []ManifestListFile{manifestListFile})
 
 	// Delete old files
-	for _, key := range objectsToDeleteKeys {
-		writer.deleteObject(key)
-	}
+	writer.deleteObjects(objectsToDeleteKeys)
 }
 
 // DuckDB --------------------------------------------------------------------------------------------------------------
@@ -481,12 +475,12 @@ func (writer *IcebergTableWriter) hasOverlappingRowsInParquet(duckdbTableName st
 
 func (writer *IcebergTableWriter) insertToDuckdbTableFromParquet(duckdbTableName string, parquetFileS3Path string, cursorValue CursorValue) int64 {
 	sql := "INSERT INTO " + duckdbTableName + " SELECT * FROM read_parquet('" + parquetFileS3Path + "')"
-	if cursorValue.OverrideRows {
+	if cursorValue.OverrideAppendedRows {
 		// Exclude rows with the cursor value
 		sql += ` WHERE "` + cursorValue.ColumnName + `" != '` + cursorValue.StringValue + `'`
-		LogInfo(writer.Config, "Replacing last existing Parquet file excluding cursor value:", strings.Split(parquetFileS3Path, "/data/")[1])
+		LogDebug(writer.Config, "Replacing last existing Parquet file excluding cursor value:", strings.Split(parquetFileS3Path, "/data/")[1])
 	} else {
-		LogInfo(writer.Config, "Replacing last existing Parquet file:", strings.Split(parquetFileS3Path, "/data/")[1])
+		LogDebug(writer.Config, "Replacing last existing Parquet file:", strings.Split(parquetFileS3Path, "/data/")[1])
 	}
 
 	result, err := writer.DuckdbClient.ExecContext(context.Background(), sql)
@@ -584,6 +578,12 @@ func (writer *IcebergTableWriter) insertToDuckdbTableFromQuery(duckdbTableName s
 func (writer *IcebergTableWriter) deleteTempDuckdbTable(duckdbTableName string) {
 	_, err := writer.DuckdbClient.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+duckdbTableName)
 	PanicIfError(writer.Config, err)
+}
+
+func (writer *IcebergTableWriter) deleteObjects(keys []string) {
+	for _, key := range keys {
+		writer.deleteObject(key)
+	}
 }
 
 func (writer *IcebergTableWriter) deleteObject(key string) {

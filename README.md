@@ -10,6 +10,11 @@ BemiDB is an open-source Snowflake and Fivetran alternative bundled together. It
 - [Use cases](#use-cases)
 - [Quickstart](#quickstart)
 - [Usage](#usage)
+  - [Syncing from Amplitude](#syncing-from-amplitude)
+  - [Syncing from Attio](#syncing-from-attio)
+  - [Syncing from Dialpad](#syncing-from-dialpad)
+  - [Syncing from Postgres](#syncing-from-postgres)
+  - [Customizing S3 endpoint](#customizing-s3-endpoint)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Benchmark](#benchmark)
@@ -118,6 +123,102 @@ psql postgres://localhost:54321/bemidb -c "SELECT COUNT(*) FROM postgres.[table_
 
 ## Usage
 
+#### Syncing from Amplitude
+
+1. Create an [Amplitude API key](https://docs.gettelio.com/integrations/amplitude)
+2. Run the syncer:
+
+```sh
+docker run \
+  -e SOURCE_AMPLITUDE_API_KEY=[...] \
+  -e SOURCE_AMPLITUDE_SECRET_KEY=[...] \
+  -e SOURCE_AMPLITUDE_START_DATE=2025-01-01 \
+  -e DESTINATION_SCHEMA_NAME=amplitude \
+  -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
+  ghcr.io/bemihq/bemidb:latest syncer-amplitude
+```
+
+#### Syncing from Attio
+
+1. Create an [Attio API access token](https://docs.gettelio.com/integrations/attio)
+2. Run the syncer:
+
+```sh
+docker run \
+  -e SOURCE_ATTIO_API_ACCESS_TOKEN=[...] \
+  -e DESTINATION_SCHEMA_NAME=attio \
+  -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
+  ghcr.io/bemihq/bemidb:latest syncer-attio
+```
+
+#### Syncing from Dialpad
+
+1. Create a [Dialpad API key](https://docs.gettelio.com/integrations/dialpad)
+2. Create a webhook endpoint:
+
+```sh
+curl -X POST "https://dialpad.com/api/v2/webhooks" \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer [DIALPAD_API_KEY]" \
+     -d '{
+           "hook_url": "https://[YOUR_DOMAIN]/[YOUR_WEBHOOK_ENDPOINT]",
+           "secret": "[YOUR_WEBHOOK_SECRET]"
+         }'
+```
+
+3. Subscribe to SMS events for the created webhook:
+
+```sh
+curl -X POST "https://dialpad.com/api/v2/subscriptions/sms" \
+     -H "Content-Type: application/json" \
+     -H "Authorization: Bearer [DIALPAD_API_KEY]" \
+     -d '{
+           "direction": "all",
+           "enabled": true,
+           "endpoint_id": "[WEBHOOK_ID]",
+           "include_internal": false,
+           "status": false
+         }'
+```
+
+4. Write a small service to receive Dialpad webhook events and publish them to NATS JetStream.
+
+<details>
+<summary>See example code in Node.js</summary>
+
+```ts
+import express from 'express';
+import bodyParser from 'body-parser';
+import { jwtVerify } from 'jose';
+import { connect, JSONCodec } from 'nats';
+
+const app = express();
+app.use(bodyParser.json());
+app.post('/dialpad-webhook', async (req, res) => {
+  const { payload } = await jwtVerify(request.body, new TextEncoder().encode('[YOUR_WEBHOOK_SECRET]'), { algorithms: ['HS256'] });
+  const jsonCodec = JSONCodec();
+  const natsConnection = await connect({ servers: "nats://host.docker.internal:4222" });
+  const jetstreamManager = await natsConnection.jetstreamManager();
+  await jetstreamManager.streams.add({ name: 'bemidb', subjects: ['bemidb.dialpad'] });
+  await jetstreamManager.jetstream().publish('bemidb.dialpad', jsonCodec.encode(payload));
+});
+app.listen(3000, () => console.log('Server is running on port 3000'));
+```
+</details>
+
+5. Run the syncer:
+
+```sh
+docker run \
+  -e NATS_URL=nats://host.docker.internal:4222 \
+  -e NATS_JETSTREAM_STREAM=bemidb \
+  -e NATS_JETSTREAM_SUBJECT=bemidb.dialpad \
+  -e NATS_JETSTREAM_CONSUMER_NAME=bemidb-dialpad \
+  -e DESTINATION_SCHEMA_NAME=dialpad \
+  -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
+  ghcr.io/bemihq/bemidb:latest syncer-dialpad
+```
+
 #### Syncing from Postgres
 
 By default, BemiDB syncs all tables from the Postgres database. To include and sync only specific tables from your Postgres database:
@@ -140,28 +241,6 @@ docker run \
   -e DESTINATION_SCHEMA_NAME=postgres \
   -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
   ghcr.io/bemihq/bemidb:latest syncer-postgres
-```
-
-#### Syncing from Amplitude
-
-```sh
-docker run \
-  -e SOURCE_AMPLITUDE_API_KEY=[...] \
-  -e SOURCE_AMPLITUDE_SECRET_KEY=[...] \
-  -e SOURCE_AMPLITUDE_START_DATE=2025-01-01 \
-  -e DESTINATION_SCHEMA_NAME=amplitude \
-  -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
-  ghcr.io/bemihq/bemidb:latest syncer-amplitude
-```
-
-#### Syncing from Attio
-
-```sh
-docker run \
-  -e SOURCE_ATTIO_API_ACCESS_TOKEN=[...] \
-  -e DESTINATION_SCHEMA_NAME=attio \
-  -e AWS_REGION -e AWS_S3_BUCKET -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e CATALOG_DATABASE_URL \
-  ghcr.io/bemihq/bemidb:latest syncer-attio
 ```
 
 #### Customizing S3 endpoint
@@ -195,15 +274,6 @@ export AWS_S3_ENDPOINT=http://localhost:9000
 
 ## Configuration
 
-#### `syncer-postgres` command options
-
-| Environment variable                | Default value | Description                                                          |
-|-------------------------------------|---------------|----------------------------------------------------------------------|
-| `DESTINATION_SCHEMA_NAME`           | Required      | Schema name in BemiDB to sync data to.                               |
-| `SOURCE_POSTGRES_DATABASE_URL`      | Required      | Postgres database URL to sync data from.                             |
-| `SOURCE_POSTGRES_INCLUDE_TABLES`    |               | List of tables to include in sync. Comma-separated `schema.table`.   |
-| `SOURCE_POSTGRES_EXCLUDE_TABLES`    |               | List of tables to exclude from sync. Comma-separated `schema.table`. |
-
 #### `syncer-amplitude` command options
 
 | Environment variable          | Default value | Description                                                        |
@@ -219,6 +289,26 @@ export AWS_S3_ENDPOINT=http://localhost:9000
 |---------------------------------|---------------|--------------------------------------------|
 | `DESTINATION_SCHEMA_NAME`       | Required      | Schema name in BemiDB to sync data to.     |
 | `SOURCE_ATTIO_API_ACCESS_TOKEN` | Required      | Attio API access token for authentication. |
+
+#### `syncer-dialpad` command options
+
+| Environment variable           | Default value | Description                                                    |
+|--------------------------------|---------------|----------------------------------------------------------------|
+| `DESTINATION_SCHEMA_NAME`      | Required      | Schema name in BemiDB to sync data to.                         |
+| `NATS_URL`                     | Required      | NATS server URL for connecting to receive Dialpad SMS records. |
+| `NATS_JETSTREAM_STREAM`        | Required      | NATS JetStream stream name.                                    |
+| `NATS_JETSTREAM_SUBJECT`       | Required      | NATS JetStream subject name.                                   |
+| `NATS_JETSTREAM_CONSUMER_NAME` | Required      | NATS JetStream consumer name.                                  |
+| `NATS_FETCH_TIMEOUT_SECONDS`   | `30`          | Timeout in seconds for fetching messages from NATS.            |
+
+#### `syncer-postgres` command options
+
+| Environment variable                | Default value | Description                                                          |
+|-------------------------------------|---------------|----------------------------------------------------------------------|
+| `DESTINATION_SCHEMA_NAME`           | Required      | Schema name in BemiDB to sync data to.                               |
+| `SOURCE_POSTGRES_DATABASE_URL`      | Required      | Postgres database URL to sync data from.                             |
+| `SOURCE_POSTGRES_INCLUDE_TABLES`    |               | List of tables to include in sync. Comma-separated `schema.table`.   |
+| `SOURCE_POSTGRES_EXCLUDE_TABLES`    |               | List of tables to exclude from sync. Comma-separated `schema.table`. |
 
 #### `server` command options
 
@@ -323,6 +413,7 @@ SELECT * FROM [TABLE] WHERE [JSON_COLUMN]->>'[JSON_KEY]' = '[JSON_VALUE]';
   - [x] Amplitude (incremental)
   - [x] Attio CRM (full-refresh)
   - [x] Postgres (full-refresh)
+  - [x] Dialpad (real-time)
   - [ ] HubSpot
   - [ ] Stripe
   - [ ] Google Sheets

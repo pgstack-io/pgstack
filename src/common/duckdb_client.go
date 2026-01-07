@@ -14,9 +14,10 @@ var SYNCER_DUCKDB_BOOT_QUERIES = []string{
 }
 
 type DuckdbClient struct {
-	Config    *CommonConfig
-	Db        *sql.DB
-	Connector *duckdb.Connector
+	Config      *CommonConfig
+	Db          *sql.DB
+	Connector   *duckdb.Connector
+	BootQueries []string
 }
 
 func NewDuckdbClient(config *CommonConfig, bootQueries ...[]string) *DuckdbClient {
@@ -24,7 +25,6 @@ func NewDuckdbClient(config *CommonConfig, bootQueries ...[]string) *DuckdbClien
 	connector, err := duckdb.NewConnector("", nil)
 	PanicIfError(config, err)
 	db := sql.OpenDB(connector)
-	PanicIfError(config, err)
 
 	client := &DuckdbClient{
 		Config:    config,
@@ -32,34 +32,28 @@ func NewDuckdbClient(config *CommonConfig, bootQueries ...[]string) *DuckdbClien
 		Connector: connector,
 	}
 
-	queries := []string{
+	client.BootQueries = []string{
 		"SET timezone='UTC'",
 	}
 	if bootQueries != nil {
-		queries = append(queries, bootQueries[0]...)
+		client.BootQueries = append(client.BootQueries, bootQueries[0]...)
 	}
-	for _, query := range queries {
-		_, err := client.ExecContext(ctx, query)
-		PanicIfError(config, err)
-	}
-
-	client.setExplicitAwsCredentials(ctx)
-
+	client.BootQueries = append(
+		client.BootQueries,
+		"CREATE OR REPLACE SECRET aws_s3_secret (TYPE S3, KEY_ID '"+config.Aws.AccessKeyId+"', SECRET '"+config.Aws.SecretAccessKey+"', REGION '"+config.Aws.Region+"', ENDPOINT '"+config.Aws.S3Endpoint+"', SCOPE 's3://"+config.Aws.S3Bucket+"')",
+	)
 	if IsLocalHost(config.Aws.S3Endpoint) {
-		_, err = client.ExecContext(ctx, "SET s3_use_ssl=false")
-		PanicIfError(config, err)
+		client.BootQueries = append(client.BootQueries, "SET s3_use_ssl=false")
 	}
-
 	if config.Aws.S3Endpoint != DEFAULT_AWS_S3_ENDPOINT {
-		// Use endpoint/bucket/key (path, deprecated on AWS) instead of bucket.endpoint/key (vhost)
-		_, err = client.ExecContext(ctx, "SET s3_url_style='path'")
-		PanicIfError(config, err)
+		client.BootQueries = append(client.BootQueries, "SET s3_url_style='path'") // Use endpoint/bucket/key (path, deprecated on AWS) instead of bucket.endpoint/key (vhost)
+	}
+	if config.LogLevel == LOG_LEVEL_TRACE {
+		client.BootQueries = append(client.BootQueries, "PRAGMA enable_logging('HTTP')", "SET logging_storage = 'stdout'")
 	}
 
-	if config.LogLevel == LOG_LEVEL_TRACE {
-		_, err = client.ExecContext(ctx, "PRAGMA enable_logging('HTTP')")
-		PanicIfError(config, err)
-		_, err = client.ExecContext(ctx, "SET logging_storage = 'stdout'")
+	for _, query := range client.BootQueries {
+		_, err := client.ExecContext(ctx, query)
 		PanicIfError(config, err)
 	}
 
@@ -130,17 +124,22 @@ func (client *DuckdbClient) Close() {
 	client.Db.Close()
 }
 
-func (client *DuckdbClient) setExplicitAwsCredentials(ctx context.Context) {
-	config := client.Config
-	query := "CREATE OR REPLACE SECRET aws_s3_secret (TYPE S3, KEY_ID '$accessKeyId', SECRET '$secretAccessKey', REGION '$region', ENDPOINT '$endpoint', SCOPE '$s3Bucket')"
-	_, err := client.ExecContext(ctx, query, map[string]string{
-		"accessKeyId":     config.Aws.AccessKeyId,
-		"secretAccessKey": config.Aws.SecretAccessKey,
-		"region":          config.Aws.Region,
-		"endpoint":        config.Aws.S3Endpoint,
-		"s3Bucket":        "s3://" + config.Aws.S3Bucket,
-	})
-	PanicIfError(config, err)
+func (client *DuckdbClient) RecreateDb() {
+	ctx := context.Background()
+
+	client.Db.Close()
+
+	connector, err := duckdb.NewConnector("", nil)
+	PanicIfError(client.Config, err)
+	db := sql.OpenDB(connector)
+	client.Db = db
+	client.Connector = connector
+
+	for _, query := range client.BootQueries {
+		_, err := client.Db.ExecContext(ctx, query)
+		PanicIfError(client.Config, err)
+	}
+
 }
 
 func replaceNamedStringArgs(query string, args map[string]string) string {

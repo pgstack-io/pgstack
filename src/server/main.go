@@ -56,6 +56,9 @@ func duckdbBootQueris(config *Config) []string {
 			// Set up Iceberg
 			"INSTALL iceberg",
 			"LOAD iceberg",
+			// Set up vector similarity search
+			"INSTALL vss",
+			"LOAD vss",
 
 			// Set up schemas
 			"SELECT oid FROM pg_catalog.pg_namespace",

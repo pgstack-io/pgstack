@@ -9,7 +9,7 @@ const (
 )
 
 // https://amplitude.com/docs/apis/analytics/export
-type Event struct {
+type RecordEvent struct {
 	Adid                    string                 `json:"adid"`
 	AmplitudeAttributionIDs string                 `json:"amplitude_attribution_ids"`
 	AmplitudeEventType      string                 `json:"amplitude_event_type"`
@@ -68,7 +68,7 @@ type Event struct {
 }
 
 // Normalize $insert_id -> insert_id, $insert_key -> insert_key, $schema -> schema
-func (event *Event) ToMap() map[string]interface{} {
+func (event *RecordEvent) ToMap() map[string]interface{} {
 	result := make(map[string]interface{})
 	result["adid"] = event.Adid
 	result["amplitude_attribution_ids"] = event.AmplitudeAttributionIDs

@@ -83,7 +83,7 @@ func (amplitude *Amplitude) Export(jsonQueueWriter *common.JsonQueueWriter, star
 
 		decoder := json.NewDecoder(gzipReader)
 		for {
-			var event Event
+			var event RecordEvent
 			err := decoder.Decode(&event)
 			if err != nil {
 				if err == io.EOF {

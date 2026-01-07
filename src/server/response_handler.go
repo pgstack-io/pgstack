@@ -60,7 +60,7 @@ func (responseHandler *ResponseHandler) ColumnDescriptionTypeOid(col *sql.Column
 		return pgtype.NumericArrayOID
 	case "FLOAT":
 		return pgtype.Float4OID
-	case "FLOAT[]":
+	case "FLOAT[]", "FLOAT[" + common.EMBEDDING_COLUMN_LENGTH + "]":
 		return pgtype.Float4ArrayOID
 	case "DOUBLE":
 		return pgtype.Float8OID

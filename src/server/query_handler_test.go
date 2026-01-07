@@ -324,7 +324,7 @@ func TestHandleQuery(t *testing.T) {
 			"SELECT rel.oid FROM pg_class rel LEFT JOIN pg_extension ON rel.oid = pg_extension.oid ORDER BY rel.oid LIMIT 1;": {
 				"description": {"oid"},
 				"types":       {uint32ToString(pgtype.OIDOID)},
-				"values":      {"1978"},
+				"values":      {"1988"},
 			},
 			"SELECT pg_total_relation_size(relid) AS total_size FROM pg_catalog.pg_statio_user_tables WHERE schemaname = 'postgres'": {
 				"description": {"total_size"},
@@ -1320,7 +1320,7 @@ func TestHandleQuery(t *testing.T) {
 				"types":       {uint32ToString(pgtype.BoolOID)},
 				"values":      {"f"},
 			},
-			"SELECT CASE WHEN nsp.nspname = ANY('{information_schema}') THEN false ELSE true END AS db_support FROM pg_catalog.pg_namespace nsp WHERE nsp.oid = 1980::OID;": {
+			"SELECT CASE WHEN nsp.nspname = ANY('{information_schema}') THEN false ELSE true END AS db_support FROM pg_catalog.pg_namespace nsp LIMIT 1": {
 				"description": {"db_support"},
 				"types":       {uint32ToString(pgtype.BoolOID)},
 				"values":      {"t"},

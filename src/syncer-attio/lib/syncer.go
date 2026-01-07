@@ -4,10 +4,6 @@ import (
 	"github.com/BemiHQ/BemiDB/src/common"
 )
 
-const (
-	COMPRESSION_FACTOR = 2 // 1 GB uncompressed data x 2 = ~90MB compressed data
-)
-
 type Syncer struct {
 	Config       *Config
 	Attio        *Attio
@@ -41,9 +37,9 @@ func (syncer *Syncer) Sync() {
 		}()
 
 		syncer.WriteToIceberg(object, cappedBuffer)
-
-		common.SendAnonymousAnalytics(syncer.Config.CommonConfig, "syncer-attio-finish", syncer.name())
 	}
+
+	common.SendAnonymousAnalytics(syncer.Config.CommonConfig, "syncer-attio-finish", syncer.name())
 }
 
 func (syncer *Syncer) WriteToIceberg(object string, cappedBuffer *common.CappedBuffer) {
@@ -67,8 +63,6 @@ func (syncer *Syncer) WriteToIceberg(object string, cappedBuffer *common.CappedB
 		icebergTableWriter := common.NewIcebergTableWriter(syncer.Config.CommonConfig, syncer.StorageS3, syncer.DuckdbClient, syncingIcebergTable, icebergSchemaColumns, 1)
 		icebergTableWriter.InsertFromJsonCappedBuffer(cappedBuffer)
 	})
-
-	common.SendAnonymousAnalytics(syncer.Config.CommonConfig, "syncer-attio-finish", syncer.name())
 }
 
 func (syncer *Syncer) name() string {

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 
@@ -16,6 +18,8 @@ const (
 	PG_TX_STATUS_IDLE = 'I'
 
 	SYSTEM_AUTH_USER = "bemidb"
+
+	RETRY_SIMPLE_QUERY_TIMEOUT = 5 * time.Second
 )
 
 type PostgresServer struct {
@@ -97,11 +101,24 @@ func (server *PostgresServer) handleSimpleQuery(queryHandler *QueryHandler, quer
 	common.LogDebug(server.config.CommonConfig, "Received query:", queryMessage.String)
 	messages, err := queryHandler.HandleSimpleQuery(queryMessage.String)
 	if err != nil {
-		server.writeError(err)
-		return
+		if server.isS3NotFoundError(err) {
+			common.LogDebug(server.config.CommonConfig, "Retrying query due to resynced table")
+			time.Sleep(RETRY_SIMPLE_QUERY_TIMEOUT)
+			messages, err = queryHandler.HandleSimpleQuery(queryMessage.String)
+		}
+		if err != nil {
+			server.writeError(err)
+			return
+		}
 	}
 	messages = append(messages, &pgproto3.ReadyForQuery{TxStatus: PG_TX_STATUS_IDLE})
 	server.writeMessages(messages...)
+}
+
+func (server *PostgresServer) isS3NotFoundError(err error) bool {
+	return strings.Contains(err.Error(), "v1.metadata.json\": 404 (Not Found)") ||
+		strings.Contains(err.Error(), ".parquet' (HTTP 404)") ||
+		strings.Contains(err.Error(), ".avro' (HTTP 404)")
 }
 
 func (server *PostgresServer) handleExtendedQuery(queryHandler *QueryHandler, parseMessage *pgproto3.Parse) error {

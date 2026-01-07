@@ -6,6 +6,7 @@ install:
 		cd ../syncer-postgres && go mod tidy && cd ../lib && go mod tidy && \
 		cd ../../syncer-amplitude && go mod tidy && cd ./lib && go mod tidy && \
 		cd ../../syncer-attio && go mod tidy && cd ./lib && go mod tidy && \
+		cd ../../syncer-dialpad && go mod tidy && cd ./lib && go mod tidy && \
 		cd ../../server && go mod tidy"
 
 lint:
@@ -13,6 +14,7 @@ lint:
 		cd ../syncer-postgres && go fmt && deadcode . && staticcheck . && cd ./lib && go fmt && staticcheck . && \
 		cd ../../syncer-amplitude && go fmt && deadcode . && staticcheck . && cd ./lib && go fmt && staticcheck . && \
 		cd ../../syncer-attio && go fmt && deadcode . && staticcheck . && cd ./lib && go fmt && staticcheck . && \
+		cd ../../syncer-dialpad && go fmt && deadcode . && staticcheck . && cd ./lib && go fmt && staticcheck . && \
 		cd ../../server && go fmt && deadcode . && staticcheck ."
 
 build:

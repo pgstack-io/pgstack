@@ -15,9 +15,9 @@ type IcebergTable struct {
 }
 
 type CursorValue struct {
-	ColumnName   string
-	StringValue  string
-	OverrideRows bool // Override rows that have the same value as this cursor value (if new rows are added with the same value, they will be included in the next sync)
+	ColumnName           string
+	StringValue          string
+	OverrideAppendedRows bool // Override rows that have the same value as this cursor value (if new rows are added with the same value, they will be included in the next sync)
 }
 
 func NewIcebergTable(config *CommonConfig, storageS3 *StorageS3, duckdbClient *DuckdbClient, icebergSchemaTable IcebergSchemaTable) *IcebergTable {
@@ -103,7 +103,7 @@ func (table *IcebergTable) LastCursorValue(columnName string) CursorValue {
 
 	row := table.DuckdbClient.QueryRowContext(
 		context.Background(),
-		`SELECT CAST(max("`+columnName+`") AS VARCHAR) FROM iceberg_scan('`+metadataFileS3Path+`')`,
+		`SELECT COALESCE(CAST(max("`+columnName+`") AS VARCHAR), '') FROM iceberg_scan('`+metadataFileS3Path+`')`,
 	)
 	if row == nil {
 		return CursorValue{ColumnName: columnName}
