@@ -1,0 +1,9 @@
+# Enable Audit, Search, or both. No file defaults to Audit only.
+audit:
+  enabled: true
+search:
+  enabled: true
+  tables:
+    - name: public.products
+      indexColumns: [name, description]
+      storeColumns: [id, name, description]

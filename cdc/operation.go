@@ -1,0 +1,9 @@
+package main
+
+const (
+	OPERATION_CREATE   = "c"
+	OPERATION_UPDATE   = "u"
+	OPERATION_DELETE   = "d"
+	OPERATION_TRUNCATE = "t"
+	OPERATION_MESSAGE  = "m"
+)

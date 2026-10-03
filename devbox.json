@@ -1,15 +1,4 @@
 {
-  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.13.1/.schema/devbox.schema.json",
-  "packages": [
-    "go@1.24.4",
-    "postgresql@latest"
-  ],
-  "shell": {
-    "init_hook": [],
-    "scripts": {
-      "test": [
-        "echo \"Error: no test specified\" && exit 1"
-      ]
-    }
-  }
+  "packages": ["go@1.26"],
+  "shell": {"init_hook": [], "scripts": {}}
 }

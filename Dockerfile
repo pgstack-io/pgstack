@@ -1,88 +1,60 @@
-ARG PLATFORM=linux/arm64
+FROM golang:1.26-bookworm AS go-builder
 
-FROM --platform=$PLATFORM debian:12-slim AS base
+WORKDIR /src
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-  curl ca-certificates \
-  postgresql-client \
-  gcc g++ libc6-dev \
-  && rm -rf /var/lib/apt/lists/*
+COPY cdc/ ./cdc/
+COPY processor/ ./processor/
+COPY server/ ./server/
 
-RUN adduser --disabled-login app
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    cd cdc && CGO_ENABLED=1 go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/cdc . && \
+    cd ../processor && CGO_ENABLED=1 go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/processor . && \
+    cd ../server && CGO_ENABLED=1 go build -mod=readonly -trimpath -ldflags="-s -w" -o /out/server .
 
-WORKDIR /app
+################################################################################
 
-COPY --chown=app:app scripts/catalog.sql /app/scripts/
+FROM nats:2.11.8 AS nats-server
 
-# Set up syncers and server ########################################################################
+################################################################################
 
-FROM base AS compile
+FROM natsio/nats-box:0.19.7 AS nats-box
 
-# Install Go
+################################################################################
 
-ENV GOROOT /usr/local/go
-ENV GOPATH /go
-ENV PATH $GOPATH/bin:$GOROOT/bin:$PATH
+FROM rclone/rclone:1.74.2 AS rclone
 
-RUN \
-  ARCH=$(dpkg --print-architecture) \
-  && curl -L "https://go.dev/dl/go1.24.4.linux-$ARCH.tar.gz" -o go.tar.gz \
-  && tar -C /usr/local -xzf go.tar.gz \
-  && rm go.tar.gz \
-  && mkdir -p "$GOPATH/src" "$GOPATH/bin" \
-  && chmod -R 777 "$GOPATH"
+################################################################################
 
-# Compile syncers and server
+FROM debian:bookworm-slim
 
-COPY --chown=app:app src/common/go.mod src/common/go.sum /app/src/common/
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates libstdc++6 postgresql-client tini jq python3-yaml && \
+    rm -rf /var/lib/apt/lists/*
 
-COPY --chown=app:app src/syncer-postgres/lib/go.mod src/syncer-postgres/lib/go.sum /app/src/syncer-postgres/lib/
-COPY --chown=app:app src/syncer-postgres/go.mod src/syncer-postgres/go.sum /app/src/syncer-postgres/
-RUN cd /app/src/syncer-postgres && go mod download
+RUN useradd --create-home --uid 10001 app && \
+    mkdir -p /app/bin /var/lib/pgstack && \
+    chown -R app:app /app /var/lib/pgstack
 
-COPY --chown=app:app src/syncer-amplitude/lib/go.mod src/syncer-amplitude/lib/go.sum /app/src/syncer-amplitude/lib/
-COPY --chown=app:app src/syncer-amplitude/go.mod src/syncer-amplitude/go.sum /app/src/syncer-amplitude/
-RUN cd /app/src/syncer-amplitude && go mod download
+COPY --from=nats-server /nats-server /usr/local/bin/nats-server
+COPY --from=nats-box /usr/local/bin/nats /usr/local/bin/nats
+COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
+COPY --from=go-builder /out/cdc /app/bin/cdc
+COPY --from=go-builder /out/processor /app/bin/processor
+COPY --from=go-builder /out/server /app/bin/server
+COPY --chown=app:app local-entrypoint.sh /app/local-entrypoint.sh
 
-COPY --chown=app:app src/syncer-attio/lib/go.mod src/syncer-attio/lib/go.sum /app/src/syncer-attio/lib/
-COPY --chown=app:app src/syncer-attio/go.mod src/syncer-attio/go.sum /app/src/syncer-attio/
-RUN cd /app/src/syncer-attio && go mod download
-
-COPY --chown=app:app src/syncer-dialpad/lib/go.mod src/syncer-dialpad/lib/go.sum /app/src/syncer-dialpad/lib/
-COPY --chown=app:app src/syncer-dialpad/go.mod src/syncer-dialpad/go.sum /app/src/syncer-dialpad/
-RUN cd /app/src/syncer-dialpad && go mod download
-
-COPY --chown=app:app src/server/go.mod src/server/go.sum /app/src/server/
-RUN cd /app/src/server && go mod download
-
-COPY --chown=app:app src/common /app/src/common
-COPY --chown=app:app src/syncer-postgres /app/src/syncer-postgres
-COPY --chown=app:app src/syncer-amplitude /app/src/syncer-amplitude
-COPY --chown=app:app src/syncer-attio /app/src/syncer-attio
-COPY --chown=app:app src/syncer-dialpad /app/src/syncer-dialpad
-COPY --chown=app:app src/server /app/src/server
-
-RUN ARCH=$(dpkg --print-architecture) \
-  && cd /app/src/syncer-postgres && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/syncer-postgres \
-    && cd /app/src/syncer-amplitude && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/syncer-amplitude \
-    && cd /app/src/syncer-attio && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/syncer-attio \
-    && cd /app/src/syncer-dialpad && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/syncer-dialpad \
-    && cd /app/src/server && CGO_ENABLED=1 GOOS=linux GOARCH=$ARCH go build -o /app/bin/server
-
-# Prepare final image ##############################################################################
-
-FROM base AS final
-
-COPY --chown=app:app --from=compile \
-  /app/bin/syncer-postgres \
-  /app/bin/syncer-amplitude \
-  /app/bin/syncer-attio \
-  /app/bin/syncer-dialpad \
-  /app/bin/server \
-  /app/bin/
-COPY --chown=app:app docker/bin /app/bin/
+COPY --chown=app:app local_config.py /app/local_config.py
 
 USER app
+WORKDIR /app
 
-ENTRYPOINT ["/app/bin/run.sh"]
+LABEL org.opencontainers.image.title="PgStack" \
+      org.opencontainers.image.source="https://github.com/pgstack-io/pgstack" \
+      org.opencontainers.image.licenses="AGPL-3.0"
+
+ENV PGHOST=127.0.0.1 PGPORT=54321 PGDATABASE=pgstack PGUSER=pgstack
+
+EXPOSE 54321
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/app/local-entrypoint.sh"]

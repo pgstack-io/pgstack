@@ -1,0 +1,16 @@
+**
+!cdc/
+!cdc/*.go
+!cdc/go.mod
+!cdc/go.sum
+!processor/
+!processor/*.go
+!processor/go.mod
+!processor/go.sum
+!server/
+!server/*.go
+!server/go.mod
+!server/go.sum
+!local-entrypoint.sh
+!Dockerfile
+!local_config.py
