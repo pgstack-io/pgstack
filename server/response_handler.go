@@ -113,12 +113,18 @@ func (responseHandler *ResponseHandler) ColumnDescriptionTypeOid(col *sql.Column
 			return pgtype.NumericOID
 		}
 	}
+	if isExpandedArrayRecord(databaseTypeName) {
+		return pgtype.RecordOID
+	}
 
 	Panic(responseHandler.Config, "Unsupported serialized column type: "+databaseTypeName)
 	return 0
 }
 
 func (responseHandler *ResponseHandler) RowValuePointer(col *sql.ColumnType) interface{} {
+	if isExpandedArrayRecord(col.DatabaseTypeName()) {
+		return new(NullExpandedArrayRecord)
+	}
 	if col.DatabaseTypeName() == "UINTEGER" || col.DatabaseTypeName() == "UBIGINT" {
 		return new(NullUint64)
 	}
@@ -239,12 +245,59 @@ func (responseHandler *ResponseHandler) RowValueBytes(valuePtr interface{}, col 
 		} else {
 			return nil
 		}
+	case *NullExpandedArrayRecord:
+		if value.Present {
+			return []byte(value.String())
+		}
+		return nil
 	case *string:
 		return []byte(*value)
 	}
 
 	Panic(responseHandler.Config, "Unsupported scanned row type: "+col.ScanType().Name())
 	return nil
+}
+
+// _pg_expandarray returns a composite with fields in the order (x, n).
+func isExpandedArrayRecord(databaseTypeName string) bool {
+	return strings.HasPrefix(databaseTypeName, `STRUCT("x" `) && strings.HasSuffix(databaseTypeName, `, "n" INTEGER)`)
+}
+
+type NullExpandedArrayRecord struct {
+	Present bool
+	Value   map[string]interface{}
+}
+
+func (record *NullExpandedArrayRecord) Scan(value interface{}) error {
+	record.Present = value != nil
+	if value == nil {
+		return nil
+	}
+	fields, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("unexpected _pg_expandarray record type: %T", value)
+	}
+	record.Value = fields
+	return nil
+}
+
+func (record NullExpandedArrayRecord) String() string {
+	fields := make([]string, 2)
+	for i, name := range []string{"x", "n"} {
+		value := record.Value[name]
+		if value == nil {
+			continue
+		}
+		field := fmt.Sprint(value)
+		if boolean, ok := value.(bool); ok {
+			field = strconv.FormatBool(boolean)[:1]
+		}
+		if field == "" || strings.ContainsAny(field, ",()\"\\ \t\n\r\v\f") {
+			field = `"` + strings.NewReplacer(`\`, `\\`, `"`, `""`).Replace(field) + `"`
+		}
+		fields[i] = field
+	}
+	return "(" + strings.Join(fields, ",") + ")"
 }
 
 func (responseHandler *ResponseHandler) isSystemTableOidColumn(colName string) bool {

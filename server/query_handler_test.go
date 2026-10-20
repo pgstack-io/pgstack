@@ -20,6 +20,113 @@ type queryResponseExpectation struct {
 	values      []string
 }
 
+func TestHandleQueryExpandArray(t *testing.T) {
+	queryHandler := initQueryHandlerForTest(t)
+	tests := []struct {
+		query   string
+		columns []string
+		rows    [][]string
+	}{
+		{
+			query:   "SELECT information_schema._pg_expandarray(ARRAY[1,2])",
+			columns: []string{"_pg_expandarray"},
+			rows:    [][]string{{"(1,1)"}, {"(2,2)"}},
+		},
+		{
+			query:   "SELECT (information_schema._pg_expandarray(ARRAY[10,NULL,30])).x AS x, (information_schema._pg_expandarray(ARRAY[10,NULL,30])).n AS n",
+			columns: []string{"x", "n"},
+			rows:    [][]string{{"10", "1"}, {"", "2"}, {"30", "3"}},
+		},
+		{
+			query:   "SELECT * FROM information_schema._pg_expandarray(ARRAY[10,20])",
+			columns: []string{"x", "n"},
+			rows:    [][]string{{"10", "1"}, {"20", "2"}},
+		},
+		{
+			query:   "SELECT information_schema._pg_expandarray(ARRAY[]::integer[])",
+			columns: []string{"_pg_expandarray"},
+		},
+		{
+			query:   "SELECT information_schema._pg_expandarray(NULL::integer[])",
+			columns: []string{"_pg_expandarray"},
+		},
+		{
+			query:   "SELECT information_schema._pg_expandarray(ARRAY[NULL,1])",
+			columns: []string{"_pg_expandarray"},
+			rows:    [][]string{{"(,1)"}, {"(1,2)"}},
+		},
+		{
+			query:   `SELECT information_schema._pg_expandarray(ARRAY['', 'a,b', 'a"b', 'a\b'])`,
+			columns: []string{"_pg_expandarray"},
+			rows:    [][]string{{`("",1)`}, {`("a,b",2)`}, {`("a""b",3)`}, {`("a\\b",4)`}},
+		},
+		{
+			// JDBC expands the same array twice and accesses the composite in an outer query.
+			query: `SELECT result.key_seq, (result.keys).x AS column_number FROM (
+				SELECT (information_schema._pg_expandarray(i.indkey)).n AS key_seq,
+				information_schema._pg_expandarray(i.indkey) AS keys
+				FROM (SELECT ARRAY[3,1]::smallint[] AS indkey) i
+			) result ORDER BY result.key_seq`,
+			columns: []string{"key_seq", "column_number"},
+			rows:    [][]string{{"1", "3"}, {"2", "1"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.query, func(t *testing.T) {
+			messages, err := queryHandler.HandleSimpleQuery(test.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(messages) != len(test.rows)+2 {
+				t.Fatalf("message count = %d, want %d", len(messages), len(test.rows)+2)
+			}
+			description := messages[0].(*pgproto3.RowDescription)
+			columns := make([]string, len(description.Fields))
+			for i, field := range description.Fields {
+				columns[i] = string(field.Name)
+			}
+			if !slices.Equal(columns, test.columns) {
+				t.Fatalf("columns = %v, want %v", columns, test.columns)
+			}
+			if test.columns[0] == "_pg_expandarray" && description.Fields[0].DataTypeOID != pgtype.RecordOID {
+				t.Fatalf("record OID = %d, want %d", description.Fields[0].DataTypeOID, pgtype.RecordOID)
+			}
+			for i, row := range test.rows {
+				assertDataRow(t, messages[i+1], row)
+			}
+		})
+	}
+}
+
+func TestHandleQueryJDBCPrimaryKeysWithoutPrimaryKey(t *testing.T) {
+	queryHandler := initQueryHandlerForTest(t)
+	if _, err := queryHandler.ServerDuckdbClient.ExecContext(context.Background(), "CREATE SCHEMA audit; CREATE TABLE audit.changes(id INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	// pgjdbc getPrimaryKeys query, including the composite field access used by Airbyte.
+	assertQueryResponse(t, queryHandler, queryResponseExpectation{
+		query: `SELECT result.TABLE_CAT AS "TABLE_CAT", result.TABLE_SCHEM AS "TABLE_SCHEM",
+			result.TABLE_NAME AS "TABLE_NAME", result.COLUMN_NAME AS "COLUMN_NAME",
+			result.KEY_SEQ AS "KEY_SEQ", result.PK_NAME AS "PK_NAME"
+		FROM (
+			SELECT current_database() AS TABLE_CAT, n.nspname AS TABLE_SCHEM,
+				ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME,
+				(information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ, ci.relname AS PK_NAME,
+				information_schema._pg_expandarray(i.indkey) AS KEYS, a.attnum AS A_ATTNUM,
+				i.indnkeyatts AS NUM_KEYS
+			FROM pg_catalog.pg_class ct
+			JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid)
+			JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid)
+			JOIN pg_catalog.pg_index i ON (a.attrelid = i.indrelid)
+			JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid)
+			WHERE true AND n.nspname = 'audit' AND ct.relname = 'changes' AND i.indisprimary
+		) result
+		WHERE result.A_ATTNUM = (result.KEYS).x AND result.KEY_SEQ <= result.NUM_KEYS
+		ORDER BY result.table_name, result.pk_name, result.key_seq`,
+		columnNames: []string{"TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "KEY_SEQ", "PK_NAME"},
+	})
+}
+
 func TestHandleQueryFixedSizeFloatArray(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 	if _, err := queryHandler.ServerDuckdbClient.ExecContext(
@@ -488,18 +595,16 @@ func TestHandleQueryExpressions(t *testing.T) {
 			columnNames: []string{"index"},
 			values:      []string{"1"},
 		},
-		// Temporarily disabled: _pg_expandarray is registered as a DuckDB table
-		// function, but PostgreSQL permits this composite-returning scalar syntax.
-		// {
-		// 	query:       "SELECT (information_schema._pg_expandarray(ARRAY[10])).n",
-		// 	columnNames: []string{"n"},
-		// 	values:      []string{"1"},
-		// },
-		// {
-		// 	query:       "SELECT (information_schema._pg_expandarray(ARRAY[10])).x AS value",
-		// 	columnNames: []string{"value"},
-		// 	values:      []string{"10"},
-		// },
+		{
+			query:       "SELECT (information_schema._pg_expandarray(ARRAY[10])).n",
+			columnNames: []string{"n"},
+			values:      []string{"1"},
+		},
+		{
+			query:       "SELECT (information_schema._pg_expandarray(ARRAY[10])).x AS value",
+			columnNames: []string{"value"},
+			values:      []string{"10"},
+		},
 		{
 			query:       "SELECT s.usename, r.rolconfig FROM pg_catalog.pg_shadow s LEFT JOIN pg_catalog.pg_roles r ON s.usename = r.rolname",
 			columnNames: []string{"usename", "rolconfig"},

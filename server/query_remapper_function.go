@@ -103,7 +103,10 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 
 func CreateInformationSchemaMacroQueries(config *Config) []string {
 	result := []string{
-		"CREATE MACRO _pg_expandarray(arr) AS TABLE SELECT unnest(arr) AS x, unnest(generate_series(1, array_length(arr))) AS n",
+		// PostgreSQL permits this set-returning function in both SELECT and FROM.
+		// Keep x and its one-based position together so composite field access works.
+		"CREATE MACRO _pg_expandarray(arr) AS unnest(list_transform(arr, lambda value, position: struct_pack(x := value, n := position::INTEGER)))",
+		"CREATE MACRO _pg_expandarray(arr) AS TABLE SELECT unnest(arr) AS x, unnest(generate_series(1, array_length(arr)))::INTEGER AS n",
 	}
 	PG_INFORMATION_SCHEMA_MACRO_FUNCTION_NAMES = extractMacroNames(result)
 	return result
