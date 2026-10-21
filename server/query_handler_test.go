@@ -20,6 +20,65 @@ type queryResponseExpectation struct {
 	values      []string
 }
 
+func TestHandleQueryRelationFilenode(t *testing.T) {
+	queryHandler := initQueryHandlerForTest(t)
+	for _, query := range []string{
+		`SELECT pg_relation_filenode('"audit"."changes"'::regclass)`,
+		`SELECT pg_catalog.pg_relation_filenode('"audit"."changes"'::pg_catalog.regclass)`,
+		`SELECT pg_relation_filenode(123::oid)`,
+		`SELECT pg_relation_filenode(NULL::regclass)`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			messages, err := queryHandler.HandleSimpleQuery(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertMessageTypes(t, messages, "*pgproto3.RowDescription", "*pgproto3.DataRow", "*pgproto3.CommandComplete")
+			description := messages[0].(*pgproto3.RowDescription)
+			if string(description.Fields[0].Name) != "pg_relation_filenode" || description.Fields[0].DataTypeOID != pgtype.Int8OID {
+				t.Fatalf("unexpected filenode description: %+v", description.Fields[0])
+			}
+			if messages[1].(*pgproto3.DataRow).Values[0] != nil {
+				t.Fatal("filenode must be SQL NULL")
+			}
+		})
+	}
+}
+
+func TestHandlePreparedQueryRelationFilenode(t *testing.T) {
+	queryHandler := initQueryHandlerForTest(t)
+	for _, query := range []string{
+		`SELECT pg_relation_filenode($1::regclass)`,
+		`SELECT pg_catalog.pg_relation_filenode($1::pg_catalog.regclass)`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			_, statement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: query})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer statement.Statement.Close()
+			_, statement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{
+				Parameters: [][]byte{[]byte(`"audit"."changes"`)},
+			}, statement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, statement, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, statement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, statement)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertMessageTypes(t, messages, "*pgproto3.DataRow", "*pgproto3.CommandComplete")
+			if messages[0].(*pgproto3.DataRow).Values[0] != nil {
+				t.Fatal("filenode must be SQL NULL")
+			}
+		})
+	}
+}
+
 func TestHandleQueryExpandArray(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 	tests := []struct {

@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	VERSION = "2.0.1"
+	VERSION = "2.1.0"
 
 	ENV_LOG_LEVEL     = "LOG_LEVEL"
 	ENV_AUDIT_ENABLED = "AUDIT_ENABLED"

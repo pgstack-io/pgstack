@@ -25,6 +25,7 @@ func CreatePgCatalogMacroQueries(config *Config) []string {
 		"CREATE MACRO pg_get_viewdef(view_oid) AS pg_catalog.pg_get_viewdef(view_oid), (view_oid, pretty_bool) AS pg_catalog.pg_get_viewdef(view_oid)",
 		"CREATE MACRO pg_indexes_size(regclass) AS 0",
 		"CREATE MACRO pg_is_in_recovery() AS false",
+		"CREATE MACRO pg_relation_filenode(relation) AS NULL::BIGINT",
 		"CREATE MACRO pg_table_size(regclass) AS 0",
 		"CREATE MACRO pg_tablespace_location(tablespace_oid) AS ''",
 		"CREATE MACRO pg_total_relation_size(regclass) AS 0",
@@ -140,6 +141,16 @@ func (remapper *QueryRemapperFunction) RemapFunctionCall(functionCall *pgQuery.F
 
 	// pg_catalog.func() -> main.func()
 	case PG_SCHEMA_PG_CATALOG, "":
+		if schemaFunction.Function == "pg_relation_filenode" {
+			parserTypeCast := NewParserTypeCast(remapper.config)
+			for _, argument := range functionCall.Args {
+				typeCast := parserTypeCast.TypeCast(argument)
+				parserTypeCast.RemovePgCatalog(typeCast)
+				if parserTypeCast.TypeName(typeCast) == "regclass" {
+					parserTypeCast.SetTypeName(typeCast, "text")
+				}
+			}
+		}
 		if PG_CATALOG_MACRO_FUNCTION_NAMES.Contains(schemaFunction.Function) || BUILTIN_DUCKDB_PG_FUNCTION_NAMES.Contains(schemaFunction.Function) {
 			remapper.parserFunction.RemapSchemaToMain(functionCall)
 			return schemaFunction
