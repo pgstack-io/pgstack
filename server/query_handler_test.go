@@ -29,7 +29,7 @@ func TestHandleQueryRelationFilenode(t *testing.T) {
 		`SELECT pg_relation_filenode(NULL::regclass)`,
 	} {
 		t.Run(query, func(t *testing.T) {
-			messages, err := queryHandler.HandleSimpleQuery(query)
+			messages, err := queryHandler.HandleSimpleQuery(context.Background(), query)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -52,22 +52,22 @@ func TestHandlePreparedQueryRelationFilenode(t *testing.T) {
 		`SELECT pg_catalog.pg_relation_filenode($1::pg_catalog.regclass)`,
 	} {
 		t.Run(query, func(t *testing.T) {
-			_, statement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: query})
+			_, statement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{Query: query})
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer statement.Statement.Close()
-			_, statement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{
+			_, portal1, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{
 				Parameters: [][]byte{[]byte(`"audit"."changes"`)},
 			}, statement)
+			defer portal1.Close()
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, statement, err = queryHandler.HandleDescribeQuery(&pgproto3.Describe{ObjectType: 'P'}, statement)
+			_, err = queryHandler.DescribePortal(context.Background(), &pgproto3.Describe{ObjectType: 'P'}, portal1)
 			if err != nil {
 				t.Fatal(err)
 			}
-			messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, statement)
+			messages, err := queryHandler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -132,7 +132,7 @@ func TestHandleQueryExpandArray(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.query, func(t *testing.T) {
-			messages, err := queryHandler.HandleSimpleQuery(test.query)
+			messages, err := queryHandler.HandleSimpleQuery(context.Background(), test.query)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -194,7 +194,7 @@ func TestHandleQueryFixedSizeFloatArray(t *testing.T) {
 	); err != nil {
 		t.Fatalf("create fixed-size array fixture: %v", err)
 	}
-	messages, err := queryHandler.HandleSimpleQuery("SELECT embedding FROM fixed_vector")
+	messages, err := queryHandler.HandleSimpleQuery(context.Background(), "SELECT embedding FROM fixed_vector")
 	if err != nil {
 		t.Fatalf("handle fixed-size array query: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestHandleQueryUnsignedIntegers(t *testing.T) {
 	); err != nil {
 		t.Fatalf("create unsigned integer fixture: %v", err)
 	}
-	messages, err := queryHandler.HandleSimpleQuery("SELECT chunk_index, source_position FROM unsigned_values")
+	messages, err := queryHandler.HandleSimpleQuery(context.Background(), "SELECT chunk_index, source_position FROM unsigned_values")
 	if err != nil {
 		t.Fatalf("handle unsigned integer query: %v", err)
 	}
@@ -805,7 +805,7 @@ func TestHandleParseQuery(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 
 	t.Run("query", func(t *testing.T) {
-		messages, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{
+		messages, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{
 			Query: "SELECT usename, passwd FROM pg_shadow WHERE usename=$1",
 		})
 		if err != nil {
@@ -815,18 +815,18 @@ func TestHandleParseQuery(t *testing.T) {
 		if preparedStatement.Query != "SELECT usename, passwd FROM main.pg_shadow WHERE usename = $1" {
 			t.Errorf("remapped query = %q", preparedStatement.Query)
 		}
-		if preparedStatement.Statement == nil {
+		if preparedStatement.Query == "" {
 			t.Error("prepared statement is nil")
 		}
 	})
 
 	t.Run("empty query", func(t *testing.T) {
-		messages, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{})
+		messages, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{})
 		if err != nil {
 			t.Fatalf("parse empty query: %v", err)
 		}
 		assertMessageTypes(t, messages, "*pgproto3.ParseComplete")
-		if preparedStatement.Query != "" || preparedStatement.Statement != nil {
+		if preparedStatement.Query != "" {
 			t.Errorf("empty prepared statement = %#v", preparedStatement)
 		}
 	})
@@ -836,11 +836,12 @@ func TestHandleBindQuery(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 
 	tests := []struct {
-		name       string
-		query      string
-		parameter  []byte
-		formatCode int16
-		want       any
+		name         string
+		query        string
+		parameter    []byte
+		formatCode   int16
+		parameterOID uint32
+		want         any
 	}{
 		{
 			name:      "text parameter",
@@ -849,37 +850,40 @@ func TestHandleBindQuery(t *testing.T) {
 			want:      "user",
 		},
 		{
-			name:       "4-byte binary parameter",
-			query:      "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace=$1",
-			parameter:  binary.BigEndian.AppendUint32(nil, 2200),
-			formatCode: 1,
-			want:       int32(2200),
+			name:         "4-byte binary parameter",
+			parameterOID: pgtype.Int4OID,
+			query:        "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace=$1",
+			parameter:    binary.BigEndian.AppendUint32(nil, 2200),
+			formatCode:   1,
+			want:         int64(2200),
 		},
 		{
-			name:       "8-byte binary parameter",
-			query:      "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace=$1",
-			parameter:  binary.BigEndian.AppendUint64(nil, 2200),
-			formatCode: 1,
-			want:       int64(2200),
+			name:         "8-byte binary parameter",
+			parameterOID: pgtype.Int8OID,
+			query:        "SELECT c.oid FROM pg_catalog.pg_class c WHERE c.relnamespace=$1",
+			parameter:    binary.BigEndian.AppendUint64(nil, 2200),
+			formatCode:   1,
+			want:         int64(2200),
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{Query: test.query})
+			_, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{Query: test.query, ParameterOIDs: []uint32{test.parameterOID}})
 			if err != nil {
 				t.Fatalf("parse query: %v", err)
 			}
-			messages, preparedStatement, err := queryHandler.HandleBindQuery(&pgproto3.Bind{
+			messages, portal2, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{
 				Parameters:           [][]byte{test.parameter},
 				ParameterFormatCodes: []int16{test.formatCode},
 			}, preparedStatement)
+			defer portal2.Close()
 			if err != nil {
 				t.Fatalf("bind query: %v", err)
 			}
 			assertMessageTypes(t, messages, "*pgproto3.BindComplete")
-			if len(preparedStatement.Variables) != 1 || preparedStatement.Variables[0] != test.want {
-				t.Errorf("bound variables = %#v, want %#v", preparedStatement.Variables, test.want)
+			if len(portal2.Variables) != 1 || portal2.Variables[0] != test.want {
+				t.Errorf("bound variables = %#v, want %#v", portal2.Variables, test.want)
 			}
 		})
 	}
@@ -891,21 +895,22 @@ func TestHandleBindQuery(t *testing.T) {
 func TestHandleTextArrayBindQuery(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 
-	_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{
+	_, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{
 		Query: "SELECT 'sec,ond' = ANY($1::pg_catalog.text[])",
 	})
 	if err != nil {
 		t.Fatalf("parse query: %v", err)
 	}
 
-	_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{
+	_, portal3, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{
 		Parameters: [][]byte{[]byte(`{first,"sec,ond"}`)},
 	}, preparedStatement)
+	defer portal3.Close()
 	if err != nil {
 		t.Fatalf("bind query: %v", err)
 	}
 
-	messages, err := queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+	messages, err := queryHandler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal3)
 	if err != nil {
 		t.Fatalf("execute query: %v", err)
 	}
@@ -917,31 +922,32 @@ func TestHandleDescribeAndExecuteQuery(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 
 	t.Run("describe and execute", func(t *testing.T) {
-		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{
+		_, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{
 			Query: "SELECT usename, split_part(passwd, ':', 1) FROM pg_shadow WHERE usename=$1",
 		})
 		if err != nil {
 			t.Fatalf("parse query: %v", err)
 		}
-		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{
+		_, portal4, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{
 			Parameters: [][]byte{[]byte("user")},
 		}, preparedStatement)
+		defer portal4.Close()
 		if err != nil {
 			t.Fatalf("bind query: %v", err)
 		}
-		messages, preparedStatement, err := queryHandler.HandleDescribeQuery(
+		messages, err := queryHandler.DescribePortal(context.Background(),
 			&pgproto3.Describe{ObjectType: 'P'},
-			preparedStatement,
+			portal4,
 		)
 		if err != nil {
 			t.Fatalf("describe query: %v", err)
 		}
 		assertMessageTypes(t, messages, "*pgproto3.RowDescription")
-		if preparedStatement.Rows == nil {
-			t.Fatal("described prepared statement has no rows")
+		if portal4.Reader != nil {
+			t.Fatal("Describe must not execute or retain query results")
 		}
 
-		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		messages, err = queryHandler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal4)
 		if err != nil {
 			t.Fatalf("execute query: %v", err)
 		}
@@ -950,24 +956,25 @@ func TestHandleDescribeAndExecuteQuery(t *testing.T) {
 	})
 
 	t.Run("empty query", func(t *testing.T) {
-		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{})
+		_, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{})
 		if err != nil {
 			t.Fatalf("parse query: %v", err)
 		}
-		_, preparedStatement, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, preparedStatement)
+		_, portal5, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{}, preparedStatement)
+		defer portal5.Close()
 		if err != nil {
 			t.Fatalf("bind query: %v", err)
 		}
-		messages, preparedStatement, err := queryHandler.HandleDescribeQuery(
+		messages, err := queryHandler.DescribePortal(context.Background(),
 			&pgproto3.Describe{ObjectType: 'P'},
-			preparedStatement,
+			portal5,
 		)
 		if err != nil {
 			t.Fatalf("describe query: %v", err)
 		}
 		assertMessageTypes(t, messages, "*pgproto3.NoData")
 
-		messages, err = queryHandler.HandleExecuteQuery(&pgproto3.Execute{}, preparedStatement)
+		messages, err = queryHandler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal5)
 		if err != nil {
 			t.Fatalf("execute query: %v", err)
 		}
@@ -975,21 +982,21 @@ func TestHandleDescribeAndExecuteQuery(t *testing.T) {
 	})
 
 	t.Run("describe statement without bind", func(t *testing.T) {
-		_, preparedStatement, err := queryHandler.HandleParseQuery(&pgproto3.Parse{
+		_, preparedStatement, err := queryHandler.HandleParseQuery(context.Background(), &pgproto3.Parse{
 			Query:         "SELECT usename FROM pg_shadow WHERE usename=$1",
 			ParameterOIDs: []uint32{25},
 		})
 		if err != nil {
 			t.Fatalf("parse query: %v", err)
 		}
-		messages, _, err := queryHandler.HandleDescribeQuery(
+		messages, err := queryHandler.DescribeStatement(context.Background(),
 			&pgproto3.Describe{ObjectType: 'S'},
 			preparedStatement,
 		)
 		if err != nil {
 			t.Fatalf("describe query: %v", err)
 		}
-		assertMessageTypes(t, messages, "*pgproto3.NoData")
+		assertMessageTypes(t, messages, "*pgproto3.ParameterDescription", "*pgproto3.RowDescription")
 	})
 }
 
@@ -997,7 +1004,7 @@ func TestHandleMultipleQueries(t *testing.T) {
 	queryHandler := initQueryHandlerForTest(t)
 
 	t.Run("multiple SET statements", func(t *testing.T) {
-		messages, err := queryHandler.HandleSimpleQuery(`SET client_encoding TO 'UTF8';
+		messages, err := queryHandler.HandleSimpleQuery(context.Background(), `SET client_encoding TO 'UTF8';
 SET client_min_messages TO 'warning';
 SET standard_conforming_strings = on;`)
 		if err != nil {
@@ -1011,7 +1018,7 @@ SET standard_conforming_strings = on;`)
 	})
 
 	t.Run("mixed SET and SELECT statements", func(t *testing.T) {
-		messages, err := queryHandler.HandleSimpleQuery(`SET client_encoding TO 'UTF8';
+		messages, err := queryHandler.HandleSimpleQuery(context.Background(), `SET client_encoding TO 'UTF8';
 SELECT split_part(passwd, ':', 1) FROM pg_shadow WHERE usename='user';`)
 		if err != nil {
 			t.Fatalf("handle queries: %v", err)
@@ -1026,7 +1033,7 @@ SELECT split_part(passwd, ':', 1) FROM pg_shadow WHERE usename='user';`)
 	})
 
 	t.Run("multiple SELECT statements", func(t *testing.T) {
-		messages, err := queryHandler.HandleSimpleQuery(`SELECT 1;
+		messages, err := queryHandler.HandleSimpleQuery(context.Background(), `SELECT 1;
 SELECT split_part(passwd, ':', 1) FROM pg_shadow WHERE usename='user';`)
 		if err != nil {
 			t.Fatalf("handle queries: %v", err)
@@ -1040,7 +1047,7 @@ SELECT split_part(passwd, ':', 1) FROM pg_shadow WHERE usename='user';`)
 	})
 
 	t.Run("error in one statement", func(t *testing.T) {
-		_, err := queryHandler.HandleSimpleQuery(`SET client_encoding TO 'UTF8';
+		_, err := queryHandler.HandleSimpleQuery(context.Background(), `SET client_encoding TO 'UTF8';
 SELECT * FROM non_existent_table;
 SET standard_conforming_strings = on;`)
 		if err == nil || !strings.Contains(err.Error(), "non_existent_table") {
@@ -1066,7 +1073,7 @@ func TestHandleSimpleQueryControlStatements(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			messages, err := queryHandler.HandleSimpleQuery(test.query)
+			messages, err := queryHandler.HandleSimpleQuery(context.Background(), test.query)
 			if err != nil {
 				t.Fatalf("handle query: %v", err)
 			}
@@ -1081,7 +1088,7 @@ func TestHandleSimpleQueryControlStatements(t *testing.T) {
 func assertQueryResponse(t *testing.T, queryHandler *QueryHandler, expectation queryResponseExpectation) {
 	t.Helper()
 
-	messages, err := queryHandler.HandleSimpleQuery(expectation.query)
+	messages, err := queryHandler.HandleSimpleQuery(context.Background(), expectation.query)
 	if err != nil {
 		t.Fatalf("handle query: %v", err)
 	}
@@ -1186,4 +1193,21 @@ func initQueryHandlerForTest(t *testing.T) *QueryHandler {
 		t.Fatalf("initialize query handler: %v", err)
 	}
 	return queryHandler
+}
+
+func TestDescribeInfersParametersWithoutClientOIDs(t *testing.T) {
+	handler := initQueryHandlerForTest(t)
+	_, statement, err := handler.HandleParseQuery(context.Background(), &pgproto3.Parse{Query: "SELECT $1::bigint AS n, $2::boolean AS flag, $3::text[] AS labels"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := handler.DescribeStatement(context.Background(), &pgproto3.Describe{ObjectType: 'S'}, statement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMessageTypes(t, messages, "*pgproto3.ParameterDescription", "*pgproto3.RowDescription")
+	oids := messages[0].(*pgproto3.ParameterDescription).ParameterOIDs
+	if !slices.Equal(oids, []uint32{pgtype.Int8OID, pgtype.BoolOID, pgtype.TextArrayOID}) {
+		t.Fatalf("parameter types = %v", oids)
+	}
 }

@@ -141,11 +141,6 @@ func (client *DuckdbClient) QueryContext(ctx context.Context, query string, args
 	return client.Db.QueryContext(ctx, query, args...)
 }
 
-func (client *DuckdbClient) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
-	LogDebug(client.Config, "Preparing DuckDB statement:", query)
-	return client.Db.PrepareContext(ctx, query)
-}
-
 func (client *DuckdbClient) ExecContext(ctx context.Context, query string, args ...map[string]string) (sql.Result, error) {
 	LogDebug(client.Config, "Executing DuckDB:", query)
 	if len(args) == 0 {
@@ -183,19 +178,6 @@ func (client *DuckdbClient) ExecTransactionContext(ctx context.Context, queries 
 func (client *DuckdbClient) Close() {
 	client.Db.Close()
 	client.Connector.Close()
-}
-
-func (client *DuckdbClient) RecreateDb() error {
-	db, connector, err := client.openDatabase()
-	if err != nil {
-		return fmt.Errorf("failed to recreate DuckDB: %w", err)
-	}
-
-	client.Db.Close()
-	client.Connector.Close()
-	client.Db = db
-	client.Connector = connector
-	return nil
 }
 
 func replaceNamedStringArgs(query string, args map[string]string) string {

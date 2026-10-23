@@ -51,10 +51,6 @@ func TestSearchReaderSeesExternalCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	check("after")
-	if err := reader.RecreateDb(); err != nil {
-		t.Fatal(err)
-	}
-	check("after")
 	if _, err := writer.ExecContext(ctx, "UPDATE search_store.main.products SET name = 'latest'"); err != nil {
 		t.Fatal(err)
 	}

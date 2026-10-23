@@ -40,12 +40,6 @@ func (manager *RuntimeManager) Acquire(config *Config) (*QueryHandler, func(), e
 
 		if manager.runtime != nil {
 			runtime := manager.runtime
-			if runtime.Expired {
-				closed := runtime.Closed
-				manager.mu.Unlock()
-				<-closed
-				continue
-			}
 			runtime.RequestMu.RLock()
 			manager.mu.Unlock()
 			return runtime.QueryHandler, runtime.RequestMu.RUnlock, nil
@@ -112,6 +106,7 @@ func (manager *RuntimeManager) expireRuntime(config *Config, runtime *ServerRunt
 		return
 	}
 	runtime.Expired = true
+	manager.runtime = nil // Retire this generation before waiting for its readers.
 	manager.mu.Unlock()
 
 	runtime.RequestMu.Lock()

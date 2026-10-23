@@ -40,6 +40,8 @@ type QueryRemapper struct {
 }
 
 type RemappedQuery struct {
+	Classifications     []QueryClassification
+	ParameterCount      int
 	Statements          []string
 	OriginalStatements  []string
 	VectorParameters    map[int]SearchParameterSpec
@@ -75,7 +77,10 @@ func (remapper *QueryRemapper) ParseAndRemapQuery(query string) (*RemappedQuery,
 	}
 
 	var originalQueryStatements []string
+	var classifications []QueryClassification
+	parameterCount := maxVectorParameterNumber(queryTree)
 	for _, stmt := range queryTree.Stmts {
+		classifications = append(classifications, classifyQuery(stmt.Stmt))
 		originalQueryStatement, err := pgQuery.Deparse(&pgQuery.ParseResult{Stmts: []*pgQuery.RawStmt{stmt}})
 		if err != nil {
 			return nil, fmt.Errorf("couldn't deparse query: %s. %w", query, err)
@@ -99,6 +104,8 @@ func (remapper *QueryRemapper) ParseAndRemapQuery(query string) (*RemappedQuery,
 	}
 
 	return &RemappedQuery{
+		Classifications:     classifications,
+		ParameterCount:      parameterCount,
 		Statements:          queryStatements,
 		OriginalStatements:  originalQueryStatements,
 		VectorParameters:    vectorParameters,

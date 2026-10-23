@@ -56,7 +56,7 @@ func TestSearchRankQueryExecution(t *testing.T) {
 	for _, function := range []string{"semantic_rank", "keyword_rank", "hybrid_rank"} {
 		t.Run(function, func(t *testing.T) {
 			before := requests
-			messages, err := handler.HandleSimpleQuery(fmt.Sprintf(`SELECT * FROM search.public_documents AS d WHERE d.body = 'waterproof' ORDER BY %s('rain jacket') LIMIT 2`, function))
+			messages, err := handler.HandleSimpleQuery(context.Background(), fmt.Sprintf(`SELECT * FROM search.public_documents AS d WHERE d.body = 'waterproof' ORDER BY %s('rain jacket') LIMIT 2`, function))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,20 +87,20 @@ func TestSearchRankQueryExecution(t *testing.T) {
 		{`SELECT id FROM search.public_documents WHERE body = $1 ORDER BY semantic_rank($2) LIMIT 1 OFFSET 1`, [][]byte{[]byte("waterproof"), []byte("rain jacket")}},
 		{`SELECT id FROM search.public_documents WHERE body = $1 ORDER BY semantic_rank('rain jacket') LIMIT 1 OFFSET 1`, [][]byte{[]byte("waterproof")}},
 	} {
-		_, prepared, err := handler.HandleParseQuery(&pgproto3.Parse{Query: input.query})
+		_, prepared, err := handler.HandleParseQuery(context.Background(), &pgproto3.Parse{Query: input.query})
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, prepared, err = handler.HandleBindQuery(&pgproto3.Bind{Parameters: input.parameters}, prepared)
+		_, portal1, err := handler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: input.parameters}, prepared)
+		defer portal1.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
-		messages, err := handler.HandleExecuteQuery(&pgproto3.Execute{}, prepared)
+		messages, err := handler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal1)
 		if err != nil {
 			t.Fatal(err)
 		}
 		assertDataRow(t, messages[0], []string{"2"})
-		prepared.Statement.Close()
 	}
 	for _, function := range []string{"keyword_rank", "hybrid_rank"} {
 		for _, argument := range []string{"$2", "'rain jacket'"} {
@@ -108,15 +108,16 @@ func TestSearchRankQueryExecution(t *testing.T) {
 			if argument == "$2" {
 				parameters = append(parameters, []byte("rain jacket"))
 			}
-			_, prepared, err := handler.HandleParseQuery(&pgproto3.Parse{Query: fmt.Sprintf("SELECT id, %s(%s) AS rank FROM search.public_documents WHERE body = $1 ORDER BY %s(%s) LIMIT 1 OFFSET 1", function, argument, function, argument)})
+			_, prepared, err := handler.HandleParseQuery(context.Background(), &pgproto3.Parse{Query: fmt.Sprintf("SELECT id, %s(%s) AS rank FROM search.public_documents WHERE body = $1 ORDER BY %s(%s) LIMIT 1 OFFSET 1", function, argument, function, argument)})
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, prepared, err = handler.HandleBindQuery(&pgproto3.Bind{Parameters: parameters}, prepared)
+			_, portal2, err := handler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: parameters}, prepared)
+			defer portal2.Close()
 			if err != nil {
 				t.Fatal(err)
 			}
-			messages, err := handler.HandleExecuteQuery(&pgproto3.Execute{}, prepared)
+			messages, err := handler.HandleExecuteQuery(context.Background(), &pgproto3.Execute{}, portal2)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,11 +128,10 @@ func TestSearchRankQueryExecution(t *testing.T) {
 			if string(messages[0].(*pgproto3.DataRow).Values[0]) != expected {
 				t.Fatalf("unexpected %s results: %#v", function, messages)
 			}
-			prepared.Statement.Close()
 		}
 	}
 	before := requests
-	messages, err := handler.HandleSimpleQuery(`SELECT id FROM search.public_documents ORDER BY keyword_rank('missing')`)
+	messages, err := handler.HandleSimpleQuery(context.Background(), `SELECT id FROM search.public_documents ORDER BY keyword_rank('missing')`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestSearchRankQueryExecution(t *testing.T) {
 		t.Fatal("keyword search generated embeddings")
 	}
 	// The ANN-only branch must still collapse duplicate chunks and expose an explicit rank.
-	ranked, err := handler.HandleSimpleQuery(`SELECT d.id, semantic_rank('rain jacket') AS rank FROM search.public_documents AS d WHERE d.body = 'waterproof' ORDER BY semantic_rank('rain jacket') LIMIT 1`)
+	ranked, err := handler.HandleSimpleQuery(context.Background(), `SELECT d.id, semantic_rank('rain jacket') AS rank FROM search.public_documents AS d WHERE d.body = 'waterproof' ORDER BY semantic_rank('rain jacket') LIMIT 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,11 +152,11 @@ func TestSearchRankQueryExecution(t *testing.T) {
 		`SELECT id FROM search.public_documents ORDER BY embedding <=> '[1,2]'`,
 		`SELECT id FROM search.public_documents ORDER BY embedding <=> pgstack.embed('rain jacket')`,
 	} {
-		if _, err := handler.HandleSimpleQuery(sql); err == nil {
+		if _, err := handler.HandleSimpleQuery(context.Background(), sql); err == nil {
 			t.Fatalf("obsolete API unexpectedly supported: %s", sql)
 		}
 	}
-	messages, err = handler.HandleSimpleQuery(`SELECT * FROM search.public_documents ORDER BY id`)
+	messages, err = handler.HandleSimpleQuery(context.Background(), `SELECT * FROM search.public_documents ORDER BY id`)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,16 +215,17 @@ func TestSearchRankLanceExecution(t *testing.T) {
 			before := requests
 			var variables []interface{}
 			if argument == "$1" {
-				statement, err := handler.ServerDuckdbClient.PrepareContext(ctx, query)
+				statement, err := handler.ServerDuckdbClient.Db.PrepareContext(ctx, query)
 				if err != nil {
 					t.Fatal(err)
 				}
-				prepared := &PreparedStatement{OriginalQuery: original, Query: query, Statement: statement, VectorParameters: remapped.VectorParameters}
-				_, prepared, err = handler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("rain jacket")}}, prepared)
+				prepared := &PreparedStatement{OriginalQuery: original, Query: query, VectorParameters: remapped.VectorParameters}
+				_, portal3, err := handler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: [][]byte{[]byte("rain jacket")}}, prepared)
+				defer portal3.Close()
 				if err != nil {
 					t.Fatal(err)
 				}
-				variables = prepared.Variables
+				variables = portal3.Variables
 				statement.Close()
 			} else {
 				variables, err = handler.resolveEmbeddedLiteralParameters(ctx, remapped.VectorParameters)
@@ -329,16 +330,17 @@ func TestSearchRankLanceExecution(t *testing.T) {
 			query := strings.ReplaceAll(remapped.Statements[0], "s3://test/search/public_documents.lance", dataset)
 			var variables []interface{}
 			if len(test.parameters) > 0 {
-				statement, err := handler.ServerDuckdbClient.PrepareContext(ctx, query)
+				statement, err := handler.ServerDuckdbClient.Db.PrepareContext(ctx, query)
 				if err != nil {
 					t.Fatal(err)
 				}
-				prepared := &PreparedStatement{OriginalQuery: original, Query: query, Statement: statement, VectorParameters: remapped.VectorParameters}
-				_, prepared, err = handler.HandleBindQuery(&pgproto3.Bind{Parameters: test.parameters}, prepared)
+				prepared := &PreparedStatement{OriginalQuery: original, Query: query, VectorParameters: remapped.VectorParameters}
+				_, portal4, err := handler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: test.parameters}, prepared)
+				defer portal4.Close()
 				if err != nil {
 					t.Fatal(err)
 				}
-				variables = prepared.Variables
+				variables = portal4.Variables
 				statement.Close()
 			} else {
 				variables, err = handler.resolveEmbeddedLiteralParameters(ctx, remapped.VectorParameters)
@@ -382,16 +384,17 @@ func TestSearchRankLanceExecution(t *testing.T) {
 		}
 		query := strings.ReplaceAll(remapped.Statements[0], "s3://test/search/public_documents.lance", dataset)
 		query = strings.Replace(query, "FROM __pgstack_search_docs", "FROM __pgstack_candidate_docs", 1)
-		statement, err := handler.ServerDuckdbClient.PrepareContext(ctx, query)
+		statement, err := handler.ServerDuckdbClient.Db.PrepareContext(ctx, query)
 		if err != nil {
 			t.Fatal(err)
 		}
-		prepared := &PreparedStatement{Query: query, Statement: statement, VectorParameters: remapped.VectorParameters}
-		_, prepared, err = handler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("waterproof")}}, prepared)
+		prepared := &PreparedStatement{Query: query, VectorParameters: remapped.VectorParameters}
+		_, portal5, err := handler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: [][]byte{[]byte("waterproof")}}, prepared)
+		defer portal5.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows, err := statement.QueryContext(ctx, prepared.Variables...)
+		rows, err := statement.QueryContext(ctx, portal5.Variables...)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -65,22 +65,24 @@ func TestEmbeddingClientAndLiteralCache(t *testing.T) {
 	prepared := &PreparedStatement{VectorParameters: map[int]SearchParameterSpec{
 		1: {Dimensions: 2, RequireNonZero: true},
 	}}
-	_, prepared, err = queryHandler.HandleBindQuery(&pgproto3.Bind{Parameters: [][]byte{[]byte("dog")}}, prepared)
+	_, portal1, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{Parameters: [][]byte{[]byte("dog")}}, prepared)
+	defer portal1.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	vector := prepared.Variables[0].([]float32)
+	vector := portal1.Variables[0].([]float32)
 	if len(vector) != 2 || vector[0] != 0.6 || vector[1] != 0.8 {
 		t.Fatalf("unexpected bound embedding: %#v", vector)
 	}
 	prepared = &PreparedStatement{VectorParameters: map[int]SearchParameterSpec{
 		1: {Dimensions: 2, RequireNonZero: true, LiteralText: &dog},
 	}}
-	_, prepared, err = queryHandler.HandleBindQuery(&pgproto3.Bind{}, prepared)
+	_, portal2, err := queryHandler.HandleBindQuery(context.Background(), &pgproto3.Bind{}, prepared)
+	defer portal2.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
-	vector = prepared.Variables[0].([]float32)
+	vector = portal2.Variables[0].([]float32)
 	if len(vector) != 2 || vector[0] != 0.6 || vector[1] != 0.8 {
 		t.Fatalf("unexpected hidden literal embedding: %#v", vector)
 	}

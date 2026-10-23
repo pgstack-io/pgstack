@@ -54,7 +54,7 @@ func TestRuntimeManagerSharesLazyInitialization(t *testing.T) {
 	}
 }
 
-func TestRuntimeManagerWaitsForExpiredRuntimeToCloseBeforeRecreating(t *testing.T) {
+func TestRuntimeManagerReplacesExpiredRuntimeWhileOldReadersFinish(t *testing.T) {
 	var attempts atomic.Int32
 	runtime := fakeServerRuntime()
 	manager := &RuntimeManager{
@@ -101,14 +101,24 @@ func TestRuntimeManagerWaitsForExpiredRuntimeToCloseBeforeRecreating(t *testing.
 	}()
 
 	select {
-	case <-acquireDone:
+	case err := <-acquireDone:
+		if err != nil {
+			runtime.RequestMu.RUnlock()
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
 		runtime.RequestMu.RUnlock()
-		t.Fatal("new runtime was created before expired runtime closed")
+		t.Fatal("new queries blocked behind retired runtime")
+	}
+	select {
+	case <-expired:
+		runtime.RequestMu.RUnlock()
+		t.Fatal("old runtime closed with active reader")
 	default:
 	}
-	if got := attempts.Load(); got != 0 {
+	if got := attempts.Load(); got != 1 {
 		runtime.RequestMu.RUnlock()
-		t.Fatalf("runtime creation attempts before close = %d, want 0", got)
+		t.Fatalf("initializations = %d", got)
 	}
 
 	runtime.RequestMu.RUnlock()
@@ -117,12 +127,16 @@ func TestRuntimeManagerWaitsForExpiredRuntimeToCloseBeforeRecreating(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("expired runtime did not close")
 	}
-	if err := <-acquireDone; err != nil {
-		t.Fatalf("runtime acquisition after close failed: %v", err)
-	}
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("runtime creation attempts after close = %d, want 1", got)
 	}
+	manager.mu.Lock()
+	replacement := manager.runtime
+	manager.mu.Unlock()
+	if replacement == nil || replacement == runtime {
+		t.Fatal("closing the retired runtime removed its replacement")
+	}
+
 }
 
 func TestRuntimeManagerRetriesAfterInitializationFailure(t *testing.T) {

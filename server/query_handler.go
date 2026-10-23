@@ -3,22 +3,17 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const (
-	FALLBACK_SQL_QUERY        = "SELECT 1"
-	PREPARE_STATEMENT_TIMEOUT = 30 * time.Second
-)
+const FALLBACK_SQL_QUERY = "SELECT 1"
 
 type QueryHandler struct {
 	Config             *Config
@@ -26,32 +21,6 @@ type QueryHandler struct {
 	QueryRemapper      *QueryRemapper
 	ResponseHandler    *ResponseHandler
 	EmbeddingClient    *EmbeddingClient
-}
-
-type PreparedStatement struct {
-	// Parse
-	Name          string
-	OriginalQuery string
-	Query         string
-	Statement     *sql.Stmt
-	ParameterOIDs []uint32
-	// VectorParameters maps one-based PostgreSQL bind parameter numbers to
-	// search text/vector validation and generated search bindings.
-	VectorParameters map[int]SearchParameterSpec
-	// TextArrayParameters identifies PostgreSQL text[] values that need decoding
-	// from PostgreSQL's wire representation before DuckDB can bind them.
-	TextArrayParameters map[int]bool
-
-	// Bind
-	Bound     bool
-	Variables []interface{}
-	Portal    string
-
-	// Describe
-	Described bool
-
-	// Describe/Execute
-	Rows *sql.Rows
 }
 
 func NewQueryHandler(config *Config, serverDuckdbClient *DuckdbClient) (*QueryHandler, error) {
@@ -72,7 +41,7 @@ func NewQueryHandler(config *Config, serverDuckdbClient *DuckdbClient) (*QueryHa
 	return queryHandler, nil
 }
 
-func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgproto3.Message, error) {
+func (queryHandler *QueryHandler) HandleSimpleQuery(ctx context.Context, originalQuery string) ([]pgproto3.Message, error) {
 	remappedQuery, err := queryHandler.QueryRemapper.ParseAndRemapQuery(originalQuery)
 	if err != nil {
 		return nil, err
@@ -84,7 +53,7 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 		err := fmt.Errorf("search rank is only supported in a single simple-query statement")
 		return nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_FEATURE_NOT_SUPPORTED, err.Error(), err)
 	}
-	variables, err := queryHandler.resolveEmbeddedLiteralParameters(context.Background(), remappedQuery.VectorParameters)
+	variables, err := queryHandler.resolveEmbeddedLiteralParameters(ctx, remappedQuery.VectorParameters)
 	if err != nil {
 		return nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, err.Error(), err)
 	}
@@ -94,14 +63,14 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 	for i, queryStatement := range remappedQuery.Statements {
 		LogInfo(queryHandler.Config, "Original query:", remappedQuery.OriginalStatements[i])
 		LogInfo(queryHandler.Config, "Remapped query:", queryStatement)
-		rows, err := queryHandler.ServerDuckdbClient.QueryContext(context.Background(), queryStatement, variables...)
+		rows, err := queryHandler.ServerDuckdbClient.QueryContext(ctx, queryStatement, variables...)
 		if err != nil {
 			errorMessage := err.Error()
 			LogError(queryHandler.Config, "Query execution error:", errorMessage)
 			if errorMessage == "Binder Error: UNNEST requires a single list as input" {
 				// https://github.com/duckdbClient/duckdb/issues/11693
 				LogWarn(queryHandler.Config, "Couldn't handle query via DuckDB:", queryStatement+"\n"+err.Error())
-				queriesMsgs, err := queryHandler.HandleSimpleQuery(FALLBACK_SQL_QUERY) // self-recursion
+				queriesMsgs, err := queryHandler.HandleSimpleQuery(ctx, FALLBACK_SQL_QUERY) // self-recursion
 				if err != nil {
 					return nil, err
 				}
@@ -131,7 +100,7 @@ func (queryHandler *QueryHandler) HandleSimpleQuery(originalQuery string) ([]pgp
 	return queriesMessages, nil
 }
 
-func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]pgproto3.Message, *PreparedStatement, error) {
+func (queryHandler *QueryHandler) HandleParseQuery(ctx context.Context, message *pgproto3.Parse) ([]pgproto3.Message, *PreparedStatement, error) {
 	originalQuery := string(message.Query)
 	remappedQuery, err := queryHandler.QueryRemapper.ParseAndRemapQuery(originalQuery)
 	if err != nil {
@@ -158,55 +127,34 @@ func (queryHandler *QueryHandler) HandleParseQuery(message *pgproto3.Parse) ([]p
 		return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
 	}
 
+	preparedStatement.QueryClassification = remappedQuery.Classifications[0]
+	preparedStatement.ParameterCount = remappedQuery.ParameterCount
 	query := remappedQuery.Statements[0]
 	preparedStatement.Query = query
-	statement, err := queryHandler.prepareContextWithTimeout(query)
-	preparedStatement.Statement = statement
-	if err != nil {
+	if err := queryHandler.prepareStatement(ctx, preparedStatement); err != nil {
 		return nil, nil, err
 	}
-
 	return []pgproto3.Message{&pgproto3.ParseComplete{}}, preparedStatement, nil
 }
 
-func (queryHandler *QueryHandler) prepareContextWithTimeout(query string) (*sql.Stmt, error) {
-	ctx := context.Background()
-	timeoutCtx, cancel := context.WithTimeout(ctx, PREPARE_STATEMENT_TIMEOUT)
-	defer cancel()
-
-	type result struct {
-		statement *sql.Stmt
-		err       error
-	}
-	resultChan := make(chan result, 1)
-
-	go func() {
-		statement, err := queryHandler.ServerDuckdbClient.PrepareContext(timeoutCtx, query)
-		resultChan <- result{statement, err}
-	}()
-
-	select {
-	case res := <-resultChan:
-		return res.statement, res.err
-	case <-timeoutCtx.Done():
-		LogWarn(queryHandler.Config, "PrepareContext timed out, recreating DuckDB connection")
-		if err := queryHandler.ServerDuckdbClient.RecreateDb(); err != nil {
-			return nil, fmt.Errorf("failed to recreate DuckDB after prepare timeout: %w", err)
-		}
-		queryHandler.QueryRemapper.remapperTable.Reset()
-		return queryHandler.ServerDuckdbClient.PrepareContext(ctx, query)
-	}
-}
-
-func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
+func (queryHandler *QueryHandler) HandleBindQuery(ctx context.Context, message *pgproto3.Bind, preparedStatement *PreparedStatement) ([]pgproto3.Message, *Portal, error) {
 	if message.PreparedStatement != preparedStatement.Name {
 		err := fmt.Errorf("prepared statement mismatch, %s instead of %s: %s", message.PreparedStatement, preparedStatement.Name, preparedStatement.OriginalQuery)
 		return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "bind message references an unexpected prepared statement", err)
 	}
 
+	if n := len(message.ParameterFormatCodes); n > 1 && n != len(message.Parameters) {
+		return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "invalid parameter format count", nil)
+	}
+	for _, format := range message.ParameterFormatCodes {
+		if format != pgtype.TextFormatCode && format != pgtype.BinaryFormatCode {
+			return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "invalid parameter format code", nil)
+		}
+	}
 	var variables []interface{}
 	paramFormatCodes := message.ParameterFormatCodes
 	embeddingCache := make(map[string][]float32)
+	var types *pgtype.Map
 
 	for i, param := range message.Parameters {
 		parameterNumber := i + 1
@@ -226,33 +174,48 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 			textFormat = paramFormatCodes[i] == 0
 		}
 
+		var value interface{}
+		if textFormat {
+			value = string(param)
+		} else {
+			if i >= len(preparedStatement.ParameterOIDs) || preparedStatement.ParameterOIDs[i] == 0 {
+				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "binary parameter has no PostgreSQL type", nil)
+			}
+			if types == nil {
+				types = pgtype.NewMap()
+			}
+			var err error
+			value, err = decodeBinaryBindParameter(types, preparedStatement.ParameterOIDs[i], param)
+			if err != nil {
+				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_BINARY_REPRESENTATION, fmt.Sprintf("invalid binary value for parameter $%d", parameterNumber), err)
+			}
+		}
+
 		if vectorSpec, isVector := preparedStatement.VectorParameters[parameterNumber]; isVector {
 			if vectorSpec.LiteralText != nil || vectorSpec.SourceParameter != 0 || vectorSpec.RowCountTable != "" {
 				err := fmt.Errorf("bind message supplied a hidden search rank parameter")
 				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, err.Error(), err)
 			}
-			value, err := queryHandler.resolveSearchParameter(context.Background(), string(param), vectorSpec, embeddingCache)
+			text, ok := value.(string)
+			if !ok {
+				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, "search parameter must be text", nil)
+			}
+			value, err := queryHandler.resolveSearchParameter(ctx, text, vectorSpec, embeddingCache)
 			if err != nil {
 				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, err.Error(), err)
 			}
 			variables = append(variables, value)
-		} else if preparedStatement.TextArrayParameters[parameterNumber] {
-			value, err := parseTextArrayBindParameter(param, textFormat)
-			if err != nil {
-				return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, err.Error(), err)
-			}
-			variables = append(variables, value)
-		} else if textFormat {
-			variables = append(variables, string(param))
-		} else if len(param) == 4 {
-			variables = append(variables, int32(binary.BigEndian.Uint32(param)))
-		} else if len(param) == 8 {
-			variables = append(variables, int64(binary.BigEndian.Uint64(param)))
-		} else if len(param) == 16 {
-			variables = append(variables, uuid.UUID(param).String())
 		} else {
-			err := fmt.Errorf("unsupported parameter format: %v (length %d). Original query: %s", param, len(param), preparedStatement.OriginalQuery)
-			return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "unsupported bind parameter format", err)
+			// Text representations of PostgreSQL arrays need conversion to DuckDB lists.
+			// Binary arrays have already been decoded by their declared array codec.
+			if textFormat && preparedStatement.TextArrayParameters[parameterNumber] {
+				parsed, err := parseTextArrayBindParameter(param)
+				if err != nil {
+					return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, err.Error(), err)
+				}
+				value = parsed
+			}
+			variables = append(variables, value)
 		}
 	}
 	generatedParameterNumbers := sortedGeneratedVectorParameterNumbers(preparedStatement.VectorParameters)
@@ -271,7 +234,7 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 		} else if spec.LiteralText != nil {
 			text = *spec.LiteralText
 		}
-		value, err := queryHandler.resolveSearchParameter(context.Background(), text, spec, embeddingCache)
+		value, err := queryHandler.resolveSearchParameter(ctx, text, spec, embeddingCache)
 		if err != nil {
 			return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_INVALID_PARAMETER_VALUE, err.Error(), err)
 		}
@@ -279,23 +242,16 @@ func (queryHandler *QueryHandler) HandleBindQuery(message *pgproto3.Bind, prepar
 	}
 
 	LogDebug(queryHandler.Config, "Bound variables:", redactVectorVariables(variables, preparedStatement.VectorParameters))
-	preparedStatement.Bound = true
-	preparedStatement.Variables = variables
-	preparedStatement.Portal = message.DestinationPortal
+	portal := &Portal{PreparedStatement: preparedStatement, Name: message.DestinationPortal, Variables: variables}
 
 	messages := []pgproto3.Message{&pgproto3.BindComplete{}}
 
-	return messages, preparedStatement, nil
+	return messages, portal, nil
 }
 
-func parseTextArrayBindParameter(param []byte, textFormat bool) ([]string, error) {
-	formatCode := int16(pgtype.BinaryFormatCode)
-	if textFormat {
-		formatCode = pgtype.TextFormatCode
-	}
-
+func parseTextArrayBindParameter(param []byte) ([]string, error) {
 	var value []string
-	if err := pgtype.NewMap().Scan(pgtype.TextArrayOID, formatCode, param, &value); err != nil {
+	if err := pgtype.NewMap().Scan(pgtype.TextArrayOID, pgtype.TextFormatCode, param, &value); err != nil {
 		return nil, fmt.Errorf("invalid text[] bind parameter: %w", err)
 	}
 	return value, nil
@@ -408,62 +364,76 @@ func (queryHandler *QueryHandler) hiddenEmbeddingError(err error) error {
 	return fmt.Errorf("search rank failed")
 }
 
-func (queryHandler *QueryHandler) HandleDescribeQuery(message *pgproto3.Describe, preparedStatement *PreparedStatement) ([]pgproto3.Message, *PreparedStatement, error) {
-	switch message.ObjectType {
-	case 'S': // Statement
-		if message.Name != preparedStatement.Name {
-			err := fmt.Errorf("statement mismatch, %s instead of %s: %s", message.Name, preparedStatement.Name, preparedStatement.OriginalQuery)
-			return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "describe message references an unexpected prepared statement", err)
-		}
-	case 'P': // Portal
-		if message.Name != preparedStatement.Portal {
-			err := fmt.Errorf("portal mismatch, %s instead of %s: %s", message.Name, preparedStatement.Portal, preparedStatement.OriginalQuery)
-			return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "describe message references an unexpected portal", err)
-		}
-	default:
-		err := fmt.Errorf("unsupported describe object type: %c. Original query: %s", message.ObjectType, preparedStatement.OriginalQuery)
-		return nil, nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "unsupported describe object type", err)
+func (queryHandler *QueryHandler) DescribePortal(ctx context.Context, message *pgproto3.Describe, portal *Portal) ([]pgproto3.Message, error) {
+	if message.ObjectType != 'P' || message.Name != portal.Name {
+		return nil, fmt.Errorf("unexpected describe portal %q", message.Name)
 	}
-
-	preparedStatement.Described = true
-	if preparedStatement.Query == "" || !preparedStatement.Bound { // Empty query or Parse->[No Bind]->Describe
-		return []pgproto3.Message{&pgproto3.NoData{}}, preparedStatement, nil
-	}
-
-	rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
-	if err != nil {
-		return nil, nil, fmt.Errorf("couldn't execute statement: %w. Original query: %s", err, preparedStatement.OriginalQuery)
-	}
-	preparedStatement.Rows = rows
-
-	messages, err := queryHandler.rowsToDescriptionMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
-	if err != nil {
-		return nil, nil, err
-	}
-	return messages, preparedStatement, nil
+	return queryHandler.describeQuery(ctx, portal.PreparedStatement, portal.Variables)
 }
 
-func (queryHandler *QueryHandler) HandleExecuteQuery(message *pgproto3.Execute, preparedStatement *PreparedStatement) ([]pgproto3.Message, error) {
-	if message.Portal != preparedStatement.Portal {
-		err := fmt.Errorf("portal mismatch, %s instead of %s: %s", message.Portal, preparedStatement.Portal, preparedStatement.OriginalQuery)
-		return nil, NewClientError(PG_ERROR_SEVERITY_ERROR, PG_ERROR_CODE_PROTOCOL_VIOLATION, "execute message references an unexpected portal", err)
+func (queryHandler *QueryHandler) DescribeStatement(ctx context.Context, message *pgproto3.Describe, statement *PreparedStatement) ([]pgproto3.Message, error) {
+	if message.ObjectType != 'S' || message.Name != statement.Name {
+		return nil, fmt.Errorf("unexpected describe statement %q", message.Name)
 	}
-
-	if preparedStatement.Query == "" {
-		return []pgproto3.Message{&pgproto3.EmptyQueryResponse{}}, nil
-	}
-
-	if preparedStatement.Rows == nil { // Parse->[No Bind]->Describe->Execute or Parse->Bind->[No Describe]->Execute
-		rows, err := preparedStatement.Statement.QueryContext(context.Background(), preparedStatement.Variables...)
-		if err != nil {
-			return nil, err
+	oids := make([]uint32, statement.ParameterCount)
+	copy(oids, statement.ParameterOIDs)
+	for index := range oids {
+		if oids[index] == 0 {
+			oids[index] = pgtype.TextOID
 		}
-		preparedStatement.Rows = rows
 	}
+	parameters := &pgproto3.ParameterDescription{ParameterOIDs: oids}
+	count := max(statement.ParameterCount, len(statement.ParameterOIDs))
+	for number := range statement.VectorParameters {
+		count = max(count, number)
+	}
+	messages, err := queryHandler.describeQuery(ctx, statement, make([]interface{}, count))
+	return append([]pgproto3.Message{parameters}, messages...), err
+}
 
-	defer preparedStatement.Rows.Close()
+func (queryHandler *QueryHandler) describeQuery(ctx context.Context, statement *PreparedStatement, variables []interface{}) ([]pgproto3.Message, error) {
+	if statement.Query == "" || statement.Kind != QUERY_SELECT {
+		return []pgproto3.Message{&pgproto3.NoData{}}, nil
+	}
+	rows, err := queryHandler.ServerDuckdbClient.QueryContext(ctx, "SELECT * FROM ("+statement.Query+") AS description LIMIT 0", variables...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return queryHandler.rowsToDescriptionMessages(rows, statement.OriginalQuery)
+}
 
-	return queryHandler.rowsToDataMessages(preparedStatement.Rows, preparedStatement.OriginalQuery)
+func (queryHandler *QueryHandler) HandleExecuteQuery(ctx context.Context, message *pgproto3.Execute, portal *Portal) ([]pgproto3.Message, error) {
+	if message.Portal != portal.Name {
+		return nil, fmt.Errorf("unexpected execute portal %q", message.Portal)
+	}
+	if portal.Terminal != nil {
+		return []pgproto3.Message{portal.Terminal}, nil
+	}
+	if portal.Query == "" {
+		portal.Terminal = &pgproto3.EmptyQueryResponse{}
+		return []pgproto3.Message{portal.Terminal}, nil
+	}
+	if portal.IsCursor(message.MaxRows) {
+		return queryHandler.executeCursor(ctx, message, portal)
+	}
+	rows, err := queryHandler.ServerDuckdbClient.QueryContext(ctx, portal.Query, portal.Variables...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	messages, err := queryHandler.rowsToDataMessages(rows, portal.OriginalQuery)
+	if err != nil {
+		return nil, err
+	}
+	portal.RowsSent = int64(len(messages) - 1)
+	terminal := messages[len(messages)-1]
+	if portal.Kind == QUERY_SELECT {
+		terminal = completedSelect(portal.RowsSent)
+		messages[len(messages)-1] = terminal
+	}
+	portal.Terminal = terminal
+	return messages, nil
 }
 
 func (queryHandler *QueryHandler) rowsToDescriptionMessages(rows *sql.Rows, originalQuery string) ([]pgproto3.Message, error) {
@@ -513,6 +483,8 @@ func (queryHandler *QueryHandler) rowsToDataMessages(rows *sql.Rows, originalQue
 		commandTag = "BEGIN"
 	case strings.HasPrefix(upperOriginalQueryStatement, "COMMIT"):
 		commandTag = "COMMIT"
+	case strings.HasPrefix(upperOriginalQueryStatement, "ROLLBACK"):
+		commandTag = "ROLLBACK"
 	case strings.HasPrefix(upperOriginalQueryStatement, "CREATE MATERIALIZED VIEW "):
 		commandTag = "CREATE MATERIALIZED VIEW"
 	case strings.HasPrefix(upperOriginalQueryStatement, "DROP MATERIALIZED VIEW "):
@@ -570,4 +542,61 @@ func (queryHandler *QueryHandler) generateDataRow(rows *sql.Rows, cols []*sql.Co
 	dataRow := pgproto3.DataRow{Values: values}
 
 	return &dataRow, nil
+}
+
+func (queryHandler *QueryHandler) executeCursor(ctx context.Context, message *pgproto3.Execute, statement *Portal) ([]pgproto3.Message, error) {
+	if statement.Reader == nil {
+		cursor, err := queryHandler.newQueryCursor(ctx, statement)
+		if err != nil {
+			return nil, err
+		}
+		statement.Reader = cursor
+	}
+	cursor := statement.Reader
+	var messages []pgproto3.Message
+	remaining := message.MaxRows
+	for {
+		count := uint32(QUERY_RESULT_BATCH_SIZE)
+		if message.MaxRows > 0 {
+			count = min(count, remaining)
+		}
+		rows, err := cursor.ReadBatch(ctx, count)
+		if err != nil {
+			return nil, errors.Join(err, statement.Close())
+		}
+		cols, err := rows.ColumnTypes()
+		if err != nil {
+			rows.Close()
+			return nil, errors.Join(err, statement.Close())
+		}
+		start := statement.RowsSent
+		for rows.Next() {
+			row, err := queryHandler.generateDataRow(rows, cols)
+			if err != nil {
+				rows.Close()
+				return nil, errors.Join(err, statement.Close())
+			}
+			messages = append(messages, row)
+			statement.RowsSent++
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, errors.Join(err, statement.Close())
+		}
+		fetched := uint32(statement.RowsSent - start)
+		if fetched < count {
+			if err := statement.Close(); err != nil {
+				return nil, err
+			}
+			statement.Terminal = completedSelect(statement.RowsSent)
+			return append(messages, statement.Terminal), nil
+		}
+		if message.MaxRows > 0 {
+			remaining -= fetched
+			if remaining == 0 {
+				return append(messages, &pgproto3.PortalSuspended{}), nil
+			}
+		}
+	}
 }
