@@ -15,7 +15,8 @@ const program = new Command()
   .description('Temporary PostgreSQL access through PgStack')
   .version(version, '-v, --version')
   .option('--organization <slug>', 'Organization slug or ID', process.env.PGSTACK_ORGANIZATION)
-  .option('--json', 'Print machine-readable JSON');
+  .option('--json', 'Print machine-readable JSON')
+  .action(() => program.outputHelp());
 
 const auth = program.command('auth').description('Sign in and manage CLI credentials');
 auth.action(() => auth.outputHelp());
@@ -35,7 +36,9 @@ auth
     console.log(
       `Signed in as ${status.user.email ?? status.user.githubUsername}\nLogin expires: ${status.expiresAt.toISOString()}`,
     );
-    console.table(status.organizations);
+    console.table(
+      status.organizations.map((organization) => ({ organization: organization.slug, name: organization.name })),
+    );
   });
 
 auth
@@ -52,6 +55,7 @@ const access = program.command('access').description('Start and manage your Post
 access
   .command('start [slug]')
   .description('Start a session using a project slug or --env <environment>')
+  .addHelpText('after', '\nUse the returned PostgreSQL URL to connect.')
   .option('--env <environment>', 'Environment to access', parseEnvironment)
   .option('--duration <duration>', 'Access duration, up to 1h', '1h')
   .option('--reason <reason>', 'Reason for access')
@@ -129,15 +133,14 @@ access
 access
   .command('revoke <session>')
   .description('End access and retain the session history')
+  .addHelpText('after', '\nOpen connections close within one minute.')
   .option('--reason <reason>', 'Reason for revoking access')
   .action(async (value: string, options: { reason?: string }) => {
     const slug = parseSessionSlug(value);
     const { client, organizationId } = await sessionContext();
     const session = await client.accessSession.revoke.mutate({ organizationId, slug, reason: options.reason });
     if (program.opts().json) return printJson(session);
-    console.log(
-      `Session ${session.slug} revoked. Open connections close on the next proxy lease check (within one minute).`,
-    );
+    console.log(`Session ${session.slug} revoked.`);
   });
 
 const printJson = (value: unknown) => console.log(JSON.stringify(value, null, 2));

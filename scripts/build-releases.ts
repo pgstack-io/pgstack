@@ -1,6 +1,5 @@
-import { mkdir, copyFile, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import { version } from '../package.json';
 
 const targets = [
   'darwin-arm64',
@@ -11,6 +10,7 @@ const targets = [
   'linux-x64-musl',
   'windows-x64',
 ] as const;
+await rm('dist/releases', { recursive: true, force: true });
 await mkdir('dist/releases', { recursive: true });
 for (const target of targets) {
   const filename = `pgstack-${target}${target.startsWith('windows') ? '.exe' : ''}`;
@@ -34,5 +34,3 @@ for (const target of targets) {
     .digest('hex');
   await writeFile(`dist/releases/${filename}.sha256`, `${checksum}  ${filename}\n`);
 }
-await copyFile('LICENSE', 'dist/releases/LICENSE');
-await writeFile('dist/releases/version', `${version}\n`);

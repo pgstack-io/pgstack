@@ -51,7 +51,7 @@ pgstack access revoke <session-slug> --reason "Investigation complete"
 pgstack auth logout
 ```
 
-Sessions last up to one hour. Extensions add time but cannot leave more than one hour remaining. Expired or revoked sessions cannot be extended. Revocation ends access within one minute.
+Sessions last up to one hour. Extensions add time but cannot leave more than one hour remaining. Expired or revoked sessions cannot be extended. After revocation, open connections close within one minute.
 
 Use `--organization <slug-or-id>` when you belong to multiple organizations, `--role <name>` to select a configured database role, and `--json` for scripts. `--reason` is required when your project requires a reason. See `pgstack --help` and `pgstack access --help` for all commands.
 
@@ -73,7 +73,7 @@ make build
 
 `make up` loads `.env`, which defaults to `https://api.pgstack.dev`. Pass flags after Make's `--`, for example `make up -- access start --env staging`. You can also use `make up ARGS="access start --env staging"`.
 
-The public API contract is in `src/api.ts`. Match the backend's tRPC protocol version when updating dependencies. `bun run build:releases` creates platform binaries, SHA-256 files, and the version file in `dist/releases/`.
+The public API contract is in `src/api.ts`. Match the backend's tRPC protocol version when updating dependencies. `bun run build:releases` creates platform binaries and SHA-256 files in `dist/releases/`.
 
 ## Repository history
 
@@ -81,4 +81,4 @@ BemiDB history through `v1.8.0` remains available in Git. Version `2.0.0` starts
 
 ## License
 
-[MIT](LICENSE). Previous versions retain their original licenses. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+[MIT](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
