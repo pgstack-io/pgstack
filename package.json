@@ -1,0 +1,25 @@
+{
+  "name": "@pgstack/cli",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun src/index.ts",
+    "build": "bun build src/index.ts --compile --define 'process.env.API_URL=undefined' --outfile dist/pgstack",
+    "build:releases": "bun scripts/build-releases.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@trpc/client": "11.17.0",
+    "commander": "^14.0.0",
+    "superjson": "^2.2.6",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^6.0.3",
+    "@trpc/server": "11.17.0"
+  },
+  "license": "MIT"
+}
