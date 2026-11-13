@@ -40,6 +40,26 @@ pgstack access start --env staging
 
 When several projects share an environment, the CLI shows `slug - project name` and asks which to use. Noninteractive commands require an unambiguous selection. Environment names are `testing`, `development`, `staging`, and `production`.
 
+## Read-only sessions
+
+```sh
+pgstack access start --env production --read-only --reason "Investigate delayed orders"
+```
+
+`--read-only` guards against accidental writes on every connection using the session URL. The proxy starts upstream transactions in read-only mode and sets 60-second statement and idle-in-transaction timeouts.
+
+| SQL | Proxy behavior |
+| --- | --- |
+| `SELECT`, including joins and read-only CTEs, `VALUES`, `TABLE`, `SHOW` | Allowed |
+| Plain `EXPLAIN` of an allowed read, basic transaction and savepoint commands | Allowed |
+| `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `CREATE`, `ALTER`, `DROP`, `TRUNCATE` | Blocked, including writes inside CTEs |
+| `SELECT INTO`, `SELECT ... FOR UPDATE` or `FOR SHARE`, `EXPLAIN ANALYZE` | Blocked |
+| `SET`, `RESET`, `SET ROLE`, `BEGIN READ WRITE`, `COPY`, `CALL`, `DO`, SQL `PREPARE` and `EXECUTE` | Blocked. Parameterized queries through the PostgreSQL wire protocol are supported. |
+| Multiple statements in one simple query | Allowed only if every statement passes |
+| Function calls inside allowed queries | Allowed unless the proxy blocks the function by name, such as `set_config`, `nextval`, or `dblink_exec` |
+
+For a stronger guarantee against database writes, connect to a read-only PostgreSQL replica or use a restricted PostgreSQL role.
+
 ## Manage sessions
 
 ```sh

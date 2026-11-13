@@ -22,6 +22,7 @@ export type AccessSession = {
   projectName: string;
   environment: Environment;
   role: string;
+  readOnly?: boolean;
   expiresAt: Date;
   reason: string | null | undefined;
   revokedAt: Date | null | undefined;
@@ -51,7 +52,7 @@ export type CliRouter = TRPCBuiltRouter<
       findProjects: Query<OrganizationInput & { environment?: Environment }, Project[]>;
       findProject: Query<ProjectInput, { slug: string; name: string; requireReason: boolean }>;
       start: Mutation<
-        ProjectInput & { durationSeconds: number; reason?: string; role?: string },
+        ProjectInput & { durationSeconds: number; reason?: string; role?: string; readOnly?: boolean },
         AccessSession & { connectionUrl: string }
       >;
       list: Query<OrganizationInput & { identifier?: string }, AccessSession[]>;

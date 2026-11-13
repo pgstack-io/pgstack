@@ -60,6 +60,7 @@ access
   .option('--duration <duration>', 'Access duration, up to 1h', '1h')
   .option('--reason <reason>', 'Reason for access')
   .option('--role <role>', 'Configured Access role name', 'Default')
+  .option('--read-only', 'Guard the session against accidental writes')
   .action(
     async (
       identifier: string | undefined,
@@ -67,6 +68,7 @@ access
         duration: string;
         reason?: string;
         role: string;
+        readOnly?: boolean;
         env?: ProjectSelector['environment'];
       },
     ) => {
@@ -92,7 +94,11 @@ access
         durationSeconds,
         reason,
         role: options.role,
+        readOnly: options.readOnly || undefined,
       });
+      if (options.readOnly && session.readOnly !== true) {
+        throw new Error('The API did not confirm read-only mode for this session.');
+      }
       if (program.opts().json) return printJson(session);
       console.log(session.connectionUrl);
     },
@@ -111,6 +117,7 @@ access
         session: session.slug,
         project: session.projectSlug,
         environment: session.environment.toLowerCase(),
+        mode: session.readOnly ? 'read-only' : 'read-write',
         expires: session.expiresAt.toISOString(),
         reason: session.reason,
       })),
